@@ -5,7 +5,6 @@ Used by scripts so you can load models by short name:
 
     llava15_7b
     qwen2vl_7b
-    qwen25vl_7b
     internvl2_8b
 """
 
@@ -31,12 +30,6 @@ def build_model_config(
         from models.qwen2vl import Qwen2VLConfig
 
         config_kwargs.setdefault("model_id", "Qwen/Qwen2-VL-7B-Instruct")
-        return Qwen2VLConfig(**config_kwargs)
-
-    if name in {"qwen25vl", "qwen25vl_7b", "qwen2_5_vl_7b", "qwen2.5vl_7b"}:
-        from models.qwen2vl import Qwen2VLConfig
-
-        config_kwargs.setdefault("model_id", "Qwen/Qwen2.5-VL-7B-Instruct")
         return Qwen2VLConfig(**config_kwargs)
 
     if name in {"internvl2", "internvl2_8b"}:
@@ -67,10 +60,6 @@ def build_model_wrapper(
         "qwen2vl",
         "qwen2vl_7b",
         "qwen2_vl_7b",
-        "qwen25vl",
-        "qwen25vl_7b",
-        "qwen2_5_vl_7b",
-        "qwen2.5vl_7b",
     }:
         from models.qwen2vl import Qwen2VLWrapper
 

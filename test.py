@@ -1,10 +1,11 @@
-# scripts/test_next_models.py
-
-from __future__ import annotations
+# test_llava_all.py
 
 import argparse
+import math
 import traceback
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
+
+import torch
 
 from data.coco import load_coco_val2017
 from models.registry import build_model_wrapper
@@ -13,106 +14,72 @@ from decoding.stepwise import StepwiseConfig, generate_stepwise_batch
 from phg import PHGConfig, generate_phg_samples
 
 
-ALL_MODELS = [
-    "llava15_7b",
-    "qwen2vl_7b",
-    "internvl2_8b",
-]
+MODEL_NAME = "llava15_7b"
 
 
-DEFAULT_DTYPE = {
-    "llava15_7b": "float16",
-    "qwen2vl_7b": "bfloat16",
-    "internvl2_8b": "bfloat16",
-}
+def print_header(title: str):
+    print("\n" + "=" * 100)
+    print(title)
+    print("=" * 100)
 
 
-def qwen_model(model_name: str) -> bool:
-    return model_name in {"qwen2vl_7b"}
+def assert_good_caption(caption: str, test_name: str):
+    print("caption repr:", repr(caption))
+    print("caption:")
+    print(caption)
+
+    if not isinstance(caption, str):
+        raise AssertionError(f"{test_name}: caption is not string")
+
+    if caption.strip() == "":
+        raise AssertionError(f"{test_name}: empty caption")
+
+    if len(caption.strip().split()) < 3:
+        raise AssertionError(f"{test_name}: suspiciously short caption: {repr(caption)}")
 
 
-def internvl_model(model_name: str) -> bool:
-    return model_name == "internvl2_8b"
-
-
-def llava_model(model_name: str) -> bool:
-    return model_name == "llava15_7b"
-
-
-def use_chat_template_for_model(model_name: str) -> bool:
-    return qwen_model(model_name)
-
-
-def build_wrapper_for_test(
-    model_name: str,
-    dtype: str | None,
-    need_attention: bool = False,
-):
-    config_kwargs = {
-        "device_map": "auto",
-        "torch_dtype": dtype or DEFAULT_DTYPE[model_name],
-    }
-
-    if llava_model(model_name):
-        config_kwargs["attn_implementation"] = "eager" if need_attention else None
-
-    if qwen_model(model_name):
-        config_kwargs["attn_implementation"] = "eager" if need_attention else None
-
-        # Optional memory control. Uncomment if Qwen image token count is too high.
-        # config_kwargs["min_pixels"] = 256 * 28 * 28
-        # config_kwargs["max_pixels"] = 1280 * 28 * 28
-
-    # InternVL2 does not use attn_implementation here.
-
-    wrapper = build_model_wrapper(
-        model_name=model_name,
-        config_kwargs=config_kwargs,
+def build_llava_wrapper(dtype: str):
+    return build_model_wrapper(
+        MODEL_NAME,
+        config_kwargs={
+            "torch_dtype": dtype,
+            "device_map": "auto",
+            "attn_implementation": "eager",
+        },
     ).load()
 
-    return wrapper
 
-
-def load_one_sample():
+def load_one_sample(image_dir: str, annotation_path: str):
     samples = load_coco_val2017(
-        image_dir="data/coco2017/val2017",
-        annotation_path="data/coco2017/annotations/instances_val2017.json",
+        image_dir=image_dir,
+        annotation_path=annotation_path,
         max_samples=1,
     )
 
-    assert len(samples) == 1
-    return samples
+    sample = samples[0]
+
+    print("Sample id:", sample["id"])
+    print("Image path:", sample["image_path"])
+    print("Prompt:", sample.get("prompt", "Describe this image."))
+
+    return sample, samples
 
 
-def print_inputs(inputs):
-    print("Input keys:", list(inputs.keys()))
+def test_direct_wrapper(wrapper, sample, max_new_tokens: int):
+    print_header("1. DIRECT LLAVA WRAPPER TEST")
 
+    inputs = wrapper.prepare_batch(
+        image_paths=[sample["image_path"]],
+        prompts=[sample.get("prompt", "Describe this image.")],
+        use_chat_template=False,
+    )
+
+    print("Prepared input keys:")
     for key, value in inputs.items():
         if hasattr(value, "shape"):
             print(f"  {key}: shape={tuple(value.shape)}, dtype={value.dtype}")
         else:
-            print(f"  {key}: {type(value)} = {value}")
-
-
-def test_direct_generation(model_name: str, dtype: str | None, max_new_tokens: int):
-    print(f"\n========== DIRECT GENERATION: {model_name} ==========")
-
-    samples = load_one_sample()
-    wrapper = build_wrapper_for_test(
-        model_name=model_name,
-        dtype=dtype,
-        need_attention=False,
-    )
-
-    use_chat_template = use_chat_template_for_model(model_name)
-
-    inputs = wrapper.prepare_batch(
-        image_paths=[samples[0]["image_path"]],
-        prompts=[samples[0].get("prompt", "Describe this image.")],
-        use_chat_template=use_chat_template,
-    )
-
-    print_inputs(inputs)
+            print(f"  {key}: {type(value)}")
 
     output = wrapper.generate_from_inputs(
         inputs,
@@ -121,421 +88,477 @@ def test_direct_generation(model_name: str, dtype: str | None, max_new_tokens: i
         use_cache=True,
     )
 
-    print("Caption:", repr(output.captions[0]))
-    print(
-        "Sequences shape:",
-        None if output.sequences is None else tuple(output.sequences.shape),
-    )
+    caption = output.captions[0]
 
-    assert len(output.captions) == 1
-    assert isinstance(output.captions[0], str)
+    assert_good_caption(caption, "direct_wrapper")
 
-    # For InternVL2, blank caption means the generated-only output was sliced wrongly.
-    assert output.captions[0].strip() != "", (
-        "Blank caption. For InternVL2, check that generate_from_inputs() "
-        "does NOT slice output_ids by prompt_len when output_ids is generated-only."
-    )
+    if output.input_ids is not None:
+        print("input_ids shape:", tuple(output.input_ids.shape))
 
-    print("DIRECT OK.")
+    if output.sequences is not None:
+        print("sequences shape:", tuple(output.sequences.shape))
+
+    print("OK: direct wrapper")
 
 
-def test_registry_greedy(model_name: str, dtype: str | None, max_new_tokens: int):
-    print(f"\n========== REGISTRY GREEDY: {model_name} ==========")
+def test_normal_decoder(wrapper, samples, decoding_name: str, max_new_tokens: int):
+    print_header(f"2. NORMAL DECODER TEST: {decoding_name}")
 
-    samples = load_one_sample()
-    wrapper = build_wrapper_for_test(
-        model_name=model_name,
-        dtype=dtype,
-        need_attention=False,
-    )
-
-    config = build_decoder_config(
-        decoding_name="greedy",
-        config_kwargs={
+    if decoding_name == "greedy":
+        config_kwargs = {
             "max_new_tokens": max_new_tokens,
-        },
-    )
+            "do_sample": False,
+        }
 
-    rows = generate_samples_with_decoder(
-        decoding_name="greedy",
-        wrapper=wrapper,
-        samples=samples,
-        config=config,
-        use_chat_template=use_chat_template_for_model(model_name),
-    )
+    elif decoding_name == "dola_low":
+        config_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "dola_layers": "low",
+            "repetition_penalty": 1.2,
+            "do_sample": False,
+        }
 
-    print(rows[0])
-
-    assert "caption" in rows[0]
-    assert rows[0]["caption"].strip() != ""
-
-    print("REGISTRY GREEDY OK.")
-
-
-def test_registry_vcd(model_name: str, dtype: str | None, max_new_tokens: int):
-    print(f"\n========== REGISTRY VCD: {model_name} ==========")
-
-    if internvl_model(model_name):
-        print("SKIP: InternVL2 + VCD is not supported yet in this codebase.")
-        return
-
-    samples = load_one_sample()
-    wrapper = build_wrapper_for_test(
-        model_name=model_name,
-        dtype=dtype,
-        need_attention=False,
-    )
-
-    vcd_kwargs = {
-        "max_new_tokens": max_new_tokens,
-    
-        # Weaker VCD first.
-        "cd_alpha": 0.5,
-        "cd_beta": 0.2,
-    
-        # Less destructive than 500 for Qwen.
-        "noise_step": 300,
-    
-        # Deterministic VCD.
-        "noise_seed": 42,
-    
-        # For greedy VCD, do not use top_p.
-        "top_p": None,
-        "top_k": None,
-        "do_sample": False,
-    }
-    
-    if qwen_model(model_name):
-        vcd_kwargs["suppress_token_ids"] = wrapper.get_suppress_token_ids()
-    
-    config = build_decoder_config(
-        decoding_name="vcd",
-        config_kwargs=vcd_kwargs,
-    )
-
-    rows = generate_samples_with_decoder(
-        decoding_name="vcd",
-        wrapper=wrapper,
-        samples=samples,
-        config=config,
-        use_chat_template=use_chat_template_for_model(model_name),
-    )
-
-    print(rows[0])
-
-    assert "caption" in rows[0]
-    assert rows[0]["caption"].strip() != ""
-
-    print("REGISTRY VCD OK.")
-
-
-def test_stepwise(model_name: str, dtype: str | None, max_new_tokens: int):
-    print(f"\n========== STEPWISE: {model_name} ==========")
-
-    if internvl_model(model_name):
-        print("SKIP: InternVL2 + stepwise is not supported yet.")
-        return
-
-    samples = load_one_sample()
-
-    # LLaVA attention extraction is supported.
-    # Qwen basic stepwise decoding is tested without attention first.
-    need_attention = llava_model(model_name)
-
-    wrapper = build_wrapper_for_test(
-        model_name=model_name,
-        dtype=dtype,
-        need_attention=need_attention,
-    )
-
-    if llava_model(model_name):
-        config = StepwiseConfig(
-            decoding_mode="greedy",
-            max_new_tokens=max_new_tokens,
-            output_attentions=True,
-            selected_layers=[-8, -4, -1],
-            image_grid_shape=(24, 24),
-            stop_on_eos=True,
-            stop_on_sentence_end=False,
-        )
+    elif decoding_name == "vcd":
+        config_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "cd_alpha": 1.0,
+            "cd_beta": 0.1,
+            "noise_step": 500,
+            "top_p": None,
+            "do_sample": False,
+        }
 
     else:
-        # Qwen stepwise first sanity test: no attention extraction yet.
-        config = StepwiseConfig(
-            decoding_mode="greedy",
-            max_new_tokens=max_new_tokens,
-            output_attentions=False,
-            selected_layers=None,
-            image_grid_shape=None,
-            stop_on_eos=True,
-            stop_on_sentence_end=False,
-        )
+        raise ValueError(f"Unknown decoding: {decoding_name}")
 
-    output = generate_stepwise_batch(
+    decoder_config = build_decoder_config(
+        decoding_name=decoding_name,
+        config_kwargs=config_kwargs,
+    )
+
+    rows = generate_samples_with_decoder(
+        decoding_name=decoding_name,
         wrapper=wrapper,
-        image_paths=[samples[0]["image_path"]],
-        prompts=[samples[0].get("prompt", "Describe this image.")],
-        config=config,
-        use_chat_template=use_chat_template_for_model(model_name),
-    )
-
-    print("Caption:", repr(output.caption))
-    print("First token ids:", output.token_ids[:10])
-    print("First token texts:", [repr(x) for x in output.token_texts[:10]])
-    print("First token probs:", output.token_probs[:10])
-
-    assert output.caption.strip() != ""
-    assert len(output.steps) > 0
-
-    first_step = output.steps[0]
-    print("First step has attention:", first_step.image_attn_by_layer is not None)
-
-    if llava_model(model_name):
-        assert first_step.image_attn_by_layer is not None
-
-    print("STEPWISE OK.")
-
-
-def test_grounding_llava(dtype: str | None, max_new_tokens: int):
-    print("\n========== GROUNDING: llava15_7b ==========")
-
-    samples = load_one_sample()
-
-    wrapper = build_wrapper_for_test(
-        model_name="llava15_7b",
-        dtype=dtype,
-        need_attention=True,
-    )
-
-    from grounding import (
-        compute_ads_from_step,
-        get_kept_lh_from_step,
-        get_object_mask_from_step,
-    )
-
-    output = generate_stepwise_batch(
-        wrapper=wrapper,
-        image_paths=[samples[0]["image_path"]],
-        prompts=[samples[0].get("prompt", "Describe this image.")],
-        config=StepwiseConfig(
-            decoding_mode="greedy",
-            max_new_tokens=max_new_tokens,
-            output_attentions=True,
-            selected_layers=[-8, -4, -1],
-            image_grid_shape=(24, 24),
-        ),
+        samples=samples,
+        config=decoder_config,
         use_chat_template=False,
     )
 
-    step_record = None
+    for row in rows:
+        print("id:", row["id"])
+        caption = row["caption"]
+        assert_good_caption(caption, f"normal_decoder_{decoding_name}")
+
+    print(f"OK: normal decoder {decoding_name}")
+
+
+def build_stepwise_config(mode: str, max_new_tokens: int):
+    kwargs = {
+        "decoding_mode": mode,
+        "max_new_tokens": max_new_tokens,
+        "min_new_tokens": 0,
+        "output_attentions": True,
+        "selected_layers": [-8, -4, -1],
+        "image_grid_shape": (24, 24),
+        "keep_attn_on_cpu": True,
+        "do_sample": False,
+    }
+
+    if mode == "dola":
+        kwargs.update(
+            {
+                "dola_layers": "low",
+                "dola_relative_top": 0.1,
+                "repetition_penalty": 1.2,
+            }
+        )
+
+    elif mode == "vcd":
+        kwargs.update(
+            {
+                "cd_alpha": 1.0,
+                "cd_beta": 0.1,
+                "noise_step": 500,
+                "top_p": None,
+            }
+        )
+
+    return StepwiseConfig(**kwargs)
+
+
+def test_stepwise(wrapper, sample, mode: str, max_new_tokens: int):
+    print_header(f"3. STEPWISE TEST: {mode}")
+
+    config = build_stepwise_config(
+        mode=mode,
+        max_new_tokens=max_new_tokens,
+    )
+
+    output = generate_stepwise_batch(
+        wrapper=wrapper,
+        image_paths=[sample["image_path"]],
+        prompts=[sample.get("prompt", "Describe this image.")],
+        config=config,
+        use_chat_template=False,
+    )
+
+    assert_good_caption(output.caption, f"stepwise_{mode}")
+
+    print("\nTOKENS")
+    print("-" * 100)
+
+    for i, step in enumerate(output.steps):
+        print(
+            i,
+            "token_id=", step.token_id,
+            "token_text=", repr(step.token_text),
+            "token_prob=", step.token_prob,
+            "max_prob=", step.max_prob,
+            "has_attn=", step.image_attn_by_layer is not None,
+            "dola_layer=", step.dola_premature_layer,
+        )
+
+    has_any_attention = any(
+        step.image_attn_by_layer is not None
+        for step in output.steps
+    )
+
+    print("\nhas_any_attention:", has_any_attention)
+
+    if not has_any_attention:
+        raise AssertionError(f"stepwise_{mode}: no attention maps found")
 
     for step in output.steps:
         if step.image_attn_by_layer is not None:
-            step_record = step
+            print("\nFIRST ATTENTION STEP")
+            print("token:", repr(step.token_text))
+
+            for layer_id, attn in step.image_attn_by_layer.items():
+                print("layer:", layer_id, "attn shape:", tuple(attn.shape))
+
             break
 
-    assert step_record is not None
+    print(f"OK: stepwise {mode}")
 
-    step = {
-        "step": step_record.step,
-        "token_id": step_record.token_id,
-        "token_text": step_record.token_text,
-        "image_attn_by_layer": step_record.image_attn_by_layer,
+    return output
+
+
+def normalize_attn_to_grid(attn: torch.Tensor, grid_shape=(24, 24)) -> torch.Tensor:
+    """
+    Robust attention-map normalization for smoke testing.
+
+    Expected possibilities:
+        [576]
+        [24, 24]
+        [heads, 576]
+        [heads, 24, 24]
+    """
+
+    if not torch.is_tensor(attn):
+        attn = torch.tensor(attn)
+
+    attn = attn.detach().float().cpu()
+
+    if attn.ndim == 1:
+        if attn.numel() == grid_shape[0] * grid_shape[1]:
+            return attn.reshape(grid_shape)
+
+    if attn.ndim == 2:
+        if tuple(attn.shape) == tuple(grid_shape):
+            return attn
+
+        if attn.shape[-1] == grid_shape[0] * grid_shape[1]:
+            return attn.mean(dim=0).reshape(grid_shape)
+
+    if attn.ndim == 3:
+        if tuple(attn.shape[-2:]) == tuple(grid_shape):
+            return attn.mean(dim=0)
+
+    raise ValueError(f"Cannot convert attention shape to grid: {tuple(attn.shape)}")
+
+
+def simple_ads(attn_grid: torch.Tensor, foreground_ratio: float = 0.10) -> float:
+    """
+    Simple ADS-like smoke metric.
+
+    This is not your final paper metric. It only checks that attention can be
+    converted into a spatial map and produces a finite diffuse score.
+    """
+
+    x = attn_grid.detach().float().cpu()
+    x = torch.clamp(x, min=0)
+
+    total = x.sum()
+
+    if total <= 0:
+        return float("nan")
+
+    p = x / total
+
+    flat = p.flatten()
+    k = max(1, int(math.ceil(flat.numel() * foreground_ratio)))
+
+    topk_values, _ = torch.topk(flat, k=k)
+
+    foreground_mass = topk_values.sum().item()
+    background_mass = max(0.0, 1.0 - foreground_mass)
+
+    eps = 1e-12
+    entropy = -(flat * torch.log(flat + eps)).sum().item()
+    max_entropy = math.log(float(flat.numel()))
+
+    normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+
+    ads = background_mass * normalized_entropy
+
+    return float(ads)
+
+
+def test_grounding_ads(stepwise_output):
+    print_header("4. GROUNDING / ATTENTION / ADS SMOKE TEST")
+
+    chosen_step = None
+
+    for step in stepwise_output.steps:
+        if step.image_attn_by_layer is not None:
+            chosen_step = step
+            break
+
+    if chosen_step is None:
+        raise AssertionError("No step with image attention found")
+
+    print("chosen token:", repr(chosen_step.token_text))
+
+    ads_values = {}
+
+    for layer_id, attn in chosen_step.image_attn_by_layer.items():
+        attn_grid = normalize_attn_to_grid(attn, grid_shape=(24, 24))
+        ads_value = simple_ads(attn_grid)
+
+        print("layer:", layer_id)
+        print("attn_grid shape:", tuple(attn_grid.shape))
+        print("attn sum:", float(attn_grid.sum()))
+        print("ADS smoke value:", ads_value)
+
+        if not math.isfinite(ads_value):
+            raise AssertionError(f"ADS is not finite for layer {layer_id}")
+
+        ads_values[layer_id] = ads_value
+
+    print("OK: grounding ADS smoke")
+
+    return ads_values
+
+
+def build_phg_config(mode: str, max_new_tokens: int, max_rounds: int):
+    kwargs = {
+        "decoding_mode": mode,
+        "max_rounds": max_rounds,
+        "max_new_tokens": max_new_tokens,
+        "min_new_tokens": 3,
+        "top_k": 3,
+        "accumulate_prob": 0.5,
+        "iou_thresh": 0.5,
+        "ads_thresh": 0.45,
+        "ads_foreground_ratio": 0.10,
+        "selected_layers": [-8, -4, -1],
+        "image_grid_shape": (24, 24),
+        "debug": True,
     }
 
-    kept = get_kept_lh_from_step(
-        step,
-        image_grid_shape=(24, 24),
-        attn_sum_threshold=0.49,
-    )
+    if mode == "dola":
+        kwargs.update(
+            {
+                "dola_layers": "low",
+                "dola_relative_top": 0.1,
+                "repetition_penalty": 1.2,
+            }
+        )
 
-    ads = compute_ads_from_step(
-        step,
-        image_grid_shape=(24, 24),
-        foreground_ratio=0.10,
-        top_n_heads=3,
-        attn_sum_threshold=0.49,
-    )
+    elif mode == "vcd":
+        kwargs.update(
+            {
+                "cd_alpha": 1.0,
+                "cd_beta": 0.1,
+                "noise_step": 500,
+                "top_p": None,
+            }
+        )
 
-    mask = get_object_mask_from_step(
-        step,
-        image_grid_shape=(24, 24),
-        top_n_heads=5,
-        attn_sum_threshold=0.49,
-    )
-
-    print("Caption prefix:", repr(output.caption))
-    print("Selected heads:", kept[:3])
-    print("ADS:", ads)
-    print("Mask:", None if mask is None else {"shape": mask.shape, "area": int(mask.astype(bool).sum())})
-
-    assert ads is not None
-
-    print("GROUNDING OK.")
+    return PHGConfig(**kwargs)
 
 
-def test_phg_llava(dtype: str | None, max_new_tokens: int):
-    print("\n========== PHG: llava15_7b ==========")
+def test_phg(wrapper, samples, mode: str, max_new_tokens: int, max_rounds: int):
+    print_header(f"5. PHG SMOKE TEST: {mode}")
 
-    samples = load_one_sample()
-
-    wrapper = build_wrapper_for_test(
-        model_name="llava15_7b",
-        dtype=dtype,
-        need_attention=True,
+    config = build_phg_config(
+        mode=mode,
+        max_new_tokens=max_new_tokens,
+        max_rounds=max_rounds,
     )
 
     rows = generate_phg_samples(
         wrapper=wrapper,
         samples=samples,
-        config=PHGConfig(
-            decoding_mode="greedy",
-            max_rounds=2,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=3,
-
-            top_k=3,
-            accumulate_prob=0.5,
-
-            iou_thresh=0.5,
-            ads_thresh=0.45,
-            ads_foreground_ratio=0.10,
-
-            selected_layers=[-8, -4, -1],
-            image_grid_shape=(24, 24),
-
-            debug=False,
-        ),
+        config=config,
         use_chat_template=False,
         include_trace=True,
     )
 
     row = rows[0]
 
-    print("Caption:", repr(row["caption"]))
-    print("Objects:", row.get("objects"))
-    print("Num decisions:", len(row.get("decision_trace", [])))
+    caption = row["caption"]
+    assert_good_caption(caption, f"phg_{mode}")
+
+    print("\nOBJECTS")
+    print("-" * 100)
+    print(row.get("objects"))
+
+    print("\nDECISION TRACE")
+    print("-" * 100)
 
     for decision in row.get("decision_trace", []):
-        print(
-            {
-                "round": decision.get("round"),
-                "path": decision.get("path"),
-                "stop_reason": decision.get("stop_reason"),
-                "selected_candidate": decision.get("selected_candidate"),
-            }
-        )
+        print("round:", decision.get("round"))
+        print("path:", decision.get("path"))
+        print("stop_reason:", decision.get("stop_reason"))
 
-    assert row["caption"].strip() != ""
+        if "selected_candidate" in decision:
+            print("selected_candidate:", decision["selected_candidate"])
 
-    print("PHG OK.")
+        print("-" * 100)
+
+    print(f"OK: PHG {mode}")
 
 
-def run_one(
-    model_name: str,
-    suite: str,
-    dtype: str | None,
-    max_new_tokens: int,
-):
-    if suite == "direct":
-        test_direct_generation(model_name, dtype, max_new_tokens)
+def run_test(name: str, fn):
+    print_header(f"RUNNING: {name}")
 
-    elif suite == "greedy":
-        test_registry_greedy(model_name, dtype, max_new_tokens)
+    try:
+        result = fn()
+        print_header(f"PASSED: {name}")
+        return result
 
-    elif suite == "vcd":
-        test_registry_vcd(model_name, dtype, max_new_tokens)
-
-    elif suite == "stepwise":
-        test_stepwise(model_name, dtype, max_new_tokens)
-
-    elif suite == "grounding":
-        if not llava_model(model_name):
-            print(f"SKIP: grounding currently stable only for llava15_7b, got {model_name}")
-            return
-        test_grounding_llava(dtype, max_new_tokens)
-
-    elif suite == "phg":
-        if not llava_model(model_name):
-            print(f"SKIP: PHG currently stable only for llava15_7b, got {model_name}")
-            return
-        test_phg_llava(dtype, max_new_tokens)
-
-    elif suite == "all_safe":
-        test_direct_generation(model_name, dtype, max_new_tokens)
-        test_registry_greedy(model_name, dtype, max_new_tokens)
-
-        if not internvl_model(model_name):
-            test_registry_vcd(model_name, dtype, max_new_tokens)
-
-        if not internvl_model(model_name):
-            test_stepwise(model_name, dtype, min(max_new_tokens, 16))
-
-        if llava_model(model_name):
-            test_grounding_llava(dtype, min(max_new_tokens, 8))
-            test_phg_llava(dtype, min(max_new_tokens, 24))
-
-    else:
-        raise ValueError(f"Unknown suite: {suite}")
+    except Exception:
+        print_header(f"FAILED: {name}")
+        traceback.print_exc()
+        raise
 
 
 def main():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--dtype", default="float16")
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--stepwise-new-tokens", type=int, default=16)
+    parser.add_argument("--phg-new-tokens", type=int, default=24)
+    parser.add_argument("--phg-rounds", type=int, default=2)
+
     parser.add_argument(
-        "--model",
-        choices=ALL_MODELS + ["all"],
+        "--stage",
+        choices=[
+            "all",
+            "wrapper",
+            "normal",
+            "stepwise",
+            "grounding",
+            "phg",
+        ],
         default="all",
     )
 
     parser.add_argument(
-        "--suite",
-        choices=[
-            "direct",
-            "greedy",
-            "vcd",
-            "stepwise",
-            "grounding",
-            "phg",
-            "all_safe",
-        ],
-        default="direct",
+        "--image-dir",
+        default="data/coco2017/val2017",
     )
-
-    parser.add_argument("--dtype", default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
-    parser.add_argument("--keep-going", action="store_true")
+    parser.add_argument(
+        "--annotation-path",
+        default="data/coco2017/annotations/instances_val2017.json",
+    )
 
     args = parser.parse_args()
 
-    models = ALL_MODELS if args.model == "all" else [args.model]
+    print_header("LLAVA FULL TEST SUITE")
+    print("model:", MODEL_NAME)
+    print("dtype:", args.dtype)
+    print("stage:", args.stage)
 
-    failures: Dict[str, str] = {}
+    sample, samples = load_one_sample(
+        image_dir=args.image_dir,
+        annotation_path=args.annotation_path,
+    )
 
-    for model_name in models:
-        try:
-            run_one(
-                model_name=model_name,
-                suite=args.suite,
-                dtype=args.dtype,
+    wrapper = build_llava_wrapper(dtype=args.dtype)
+
+    if args.stage in {"all", "wrapper"}:
+        run_test(
+            "direct_wrapper",
+            lambda: test_direct_wrapper(
+                wrapper=wrapper,
+                sample=sample,
                 max_new_tokens=args.max_new_tokens,
+            ),
+        )
+
+    if args.stage in {"all", "normal"}:
+        for decoding_name in ["greedy", "dola_low", "vcd"]:
+            run_test(
+                f"normal_{decoding_name}",
+                lambda decoding_name=decoding_name: test_normal_decoder(
+                    wrapper=wrapper,
+                    samples=samples,
+                    decoding_name=decoding_name,
+                    max_new_tokens=args.max_new_tokens,
+                ),
             )
 
-        except Exception as exc:
-            failures[model_name] = repr(exc)
+    stepwise_greedy_output = None
 
-            print(f"\nFAILED: {model_name}")
-            traceback.print_exc()
+    if args.stage in {"all", "stepwise", "grounding"}:
+        for mode in ["greedy", "dola", "vcd"]:
+            output = run_test(
+                f"stepwise_{mode}",
+                lambda mode=mode: test_stepwise(
+                    wrapper=wrapper,
+                    sample=sample,
+                    mode=mode,
+                    max_new_tokens=args.stepwise_new_tokens,
+                ),
+            )
 
-            if not args.keep_going:
-                raise
+            if mode == "greedy":
+                stepwise_greedy_output = output
 
-    if failures:
-        print("\n========== FAILURES ==========")
-        for model_name, error in failures.items():
-            print(model_name, "->", error)
-    else:
-        print("\nALL REQUESTED TESTS PASSED.")
+    if args.stage in {"all", "grounding"}:
+        if stepwise_greedy_output is None:
+            stepwise_greedy_output = run_test(
+                "stepwise_greedy_for_grounding",
+                lambda: test_stepwise(
+                    wrapper=wrapper,
+                    sample=sample,
+                    mode="greedy",
+                    max_new_tokens=args.stepwise_new_tokens,
+                ),
+            )
+
+        run_test(
+            "grounding_ads",
+            lambda: test_grounding_ads(stepwise_greedy_output),
+        )
+
+    if args.stage in {"all", "phg"}:
+        for mode in ["greedy", "dola", "vcd"]:
+            run_test(
+                f"phg_{mode}",
+                lambda mode=mode: test_phg(
+                    wrapper=wrapper,
+                    samples=samples,
+                    mode=mode,
+                    max_new_tokens=args.phg_new_tokens,
+                    max_rounds=args.phg_rounds,
+                ),
+            )
+
+    print_header("ALL REQUESTED LLAVA TESTS PASSED")
 
 
 if __name__ == "__main__":

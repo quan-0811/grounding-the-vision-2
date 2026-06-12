@@ -30,3 +30,6 @@ protobuf==5.29.4
 
 nltk
 scipy
+
+timm
+qwen-vl-utils
