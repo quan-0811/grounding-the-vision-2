@@ -1,7 +1,14 @@
+# grounding/attention.py
+
 """
 Attention extraction and layer-head selection utilities.
 
 This file converts raw generated-token attentions into PHG image-attention maps.
+
+Output contract:
+    image_attn_by_layer[layer_id] = Tensor[num_heads, num_image_tokens]
+
+This is important because grounding/masks.py selects individual layer-head maps.
 """
 
 from __future__ import annotations
@@ -15,85 +22,137 @@ from grounding.ads import spatial_entropy
 from grounding.grid import image_attn_to_grid
 
 
-def get_image_token_id(model: Any, tokenizer: Any) -> int:
-    """
-    Get image token id.
+# ============================================================
+# Image-token resolution
+# ============================================================
 
-    For LLaVA:
+def get_image_token_id(model, tokenizer=None, processor=None) -> int:
+    """
+    Resolve image-token id for different LVLM families.
+
+    LLaVA:
         model.config.image_token_index
 
-    Fallback:
-        tokenizer.convert_tokens_to_ids("<image>")
+    Qwen2-VL:
+        model.config.image_token_id
+        tokenizer token: <|image_pad|>
+
+    Some processors expose:
+        processor.image_token
     """
 
-    image_token_id = getattr(model.config, "image_token_index", None)
+    config = getattr(model, "config", None)
 
-    if image_token_id is None:
-        image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+    for attr in [
+        "image_token_index",
+        "image_token_id",
+    ]:
+        value = getattr(config, attr, None)
 
-    if image_token_id is None:
-        raise ValueError("Could not resolve image token id.")
+        if value is not None:
+            return int(value)
 
-    return int(image_token_id)
+    text_config = getattr(config, "text_config", None)
+
+    for attr in [
+        "image_token_index",
+        "image_token_id",
+    ]:
+        value = getattr(text_config, attr, None)
+
+        if value is not None:
+            return int(value)
+
+    if tokenizer is not None:
+        candidate_tokens = [
+            "<|image_pad|>",  # Qwen2-VL
+            "<image>",
+            "<image_token>",
+            "<im_patch>",
+        ]
+
+        for token in candidate_tokens:
+            try:
+                token_id = tokenizer.convert_tokens_to_ids(token)
+            except Exception:
+                token_id = None
+
+            if token_id is None:
+                continue
+
+            unk_token_id = getattr(tokenizer, "unk_token_id", None)
+
+            if unk_token_id is not None and int(token_id) == int(unk_token_id):
+                continue
+
+            return int(token_id)
+
+    if processor is not None and tokenizer is not None:
+        image_token = getattr(processor, "image_token", None)
+
+        if image_token is not None:
+            try:
+                token_id = tokenizer.convert_tokens_to_ids(image_token)
+            except Exception:
+                token_id = None
+
+            if token_id is not None:
+                return int(token_id)
+
+    raise ValueError("Could not resolve image token id.")
 
 
 def resolve_image_token_indices(
-    input_ids: torch.Tensor,
-    token_attn_key_len: int,
-    current_step: int,
-    model: Any,
-    tokenizer: Any,
+    input_ids,
+    model=None,
+    tokenizer=None,
+    processor=None,
+    image_token_indices=None,
 ) -> torch.Tensor:
     """
-    Resolve image-token positions in the attention key dimension.
+    Resolve positions of image placeholder tokens in input_ids.
 
-    Handles two cases:
-
-    Case 1:
-        input_ids already contains many expanded image tokens.
-
-    Case 2:
-        input_ids contains one <image> placeholder and LLaVA internally
-        expands it into visual patch tokens.
-
-    Assumption:
-        batch size = 1, single image.
+    Returns:
+        1D LongTensor of image-token positions for batch item 0.
     """
 
-    image_token_id = get_image_token_id(model, tokenizer)
+    if image_token_indices is not None:
+        if torch.is_tensor(image_token_indices):
+            return image_token_indices.long()
 
-    raw_img_positions = (
-        input_ids[0] == image_token_id
-    ).nonzero(as_tuple=False).flatten()
+        return torch.tensor(
+            image_token_indices,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
 
-    if len(raw_img_positions) == 0:
-        return torch.empty(0, dtype=torch.long)
+    if input_ids is None:
+        raise ValueError("input_ids is required to resolve image token indices.")
 
-    raw_prompt_len = input_ids.shape[1]
+    if input_ids.dim() == 2:
+        ids = input_ids[0]
+    else:
+        ids = input_ids
 
-    # During decoding:
-    # key_len = expanded_prompt_len + generated_tokens_seen
-    # At current_step=0, after feeding the first generated token:
-    # key_len = expanded_prompt_len + 1
-    expanded_prompt_len = int(token_attn_key_len) - (int(current_step) + 1)
+    image_token_id = get_image_token_id(
+        model=model,
+        tokenizer=tokenizer,
+        processor=processor,
+    )
 
-    # Case 1: image tokens are already expanded in input_ids.
-    if len(raw_img_positions) > 1:
-        return raw_img_positions.detach().cpu().long()
+    indices = torch.where(ids == int(image_token_id))[0]
 
-    # Case 2: single placeholder expanded internally.
-    placeholder_pos = int(raw_img_positions[0].item())
+    if indices.numel() == 0:
+        raise ValueError(
+            f"No image token positions found for image_token_id={image_token_id}."
+        )
 
-    num_image_tokens = expanded_prompt_len - (raw_prompt_len - 1)
+    return indices.long()
 
-    if num_image_tokens <= 0:
-        return torch.empty(0, dtype=torch.long)
 
-    image_start = placeholder_pos
-    image_end = placeholder_pos + num_image_tokens
-
-    return torch.arange(image_start, image_end, dtype=torch.long)
-
+# ============================================================
+# Layer / attention helpers
+# ============================================================
 
 def _resolve_layer_ids(
     num_layers: int,
@@ -106,129 +165,223 @@ def _resolve_layer_ids(
     if selected_layers is None:
         return list(range(num_layers))
 
-    layer_ids = []
+    layer_ids: List[int] = []
 
     for layer_id in selected_layers:
-        if layer_id < 0:
-            layer_id = num_layers + layer_id
+        real_layer_id = int(layer_id)
 
-        if layer_id < 0 or layer_id >= num_layers:
-            raise ValueError(
-                f"Layer id {layer_id} is out of range for {num_layers} layers."
-            )
+        if real_layer_id < 0:
+            real_layer_id = num_layers + real_layer_id
 
-        layer_ids.append(int(layer_id))
+        if real_layer_id < 0 or real_layer_id >= num_layers:
+            continue
+
+        layer_ids.append(real_layer_id)
 
     return layer_ids
 
 
-def extract_image_attn_by_layer(
-    attentions: Sequence[torch.Tensor],
-    input_ids: torch.Tensor,
-    token_attn_key_len: Optional[int] = None,
-    current_step: int = 0,
-    model: Optional[Any] = None,
-    tokenizer: Optional[Any] = None,
-    image_token_indices: Optional[torch.Tensor] = None,
-    selected_layers: Optional[Sequence[int]] = None,
-    keep_attn_on_cpu: bool = True,
-) -> Tuple[Dict[int, torch.Tensor], torch.Tensor]:
+def _unwrap_layer_attention(layer_attn):
     """
-    Extract image attention for the last generated token.
+    Some models return tuple/list objects per layer.
+    Extract the actual tensor.
+    """
 
-    Args:
-        attentions:
-            Model output attentions. Each layer usually has shape:
-                [batch, heads, query_len, key_len]
+    if isinstance(layer_attn, (tuple, list)):
+        if len(layer_attn) == 0:
+            return None
 
-        input_ids:
-            Original prompt input ids. For LLaVA this contains one <image>
-            placeholder.
+        layer_attn = layer_attn[0]
 
-        token_attn_key_len:
-            Optional explicit key length.
+    if layer_attn is None:
+        return None
 
-        current_step:
-            Generated-token step index.
+    if not torch.is_tensor(layer_attn):
+        return None
 
-        model/tokenizer:
-            Needed if image_token_indices is not supplied.
+    return layer_attn
 
-        image_token_indices:
-            Optional cached visual-token positions.
 
-        selected_layers:
-            Optional layer subset, e.g. [-8, -4, -1].
+def _extract_last_query_attention(layer_attn: torch.Tensor) -> Optional[torch.Tensor]:
+    """
+    Convert one layer's raw attention into:
+        Tensor[num_heads, key_len]
 
-        keep_attn_on_cpu:
-            Store extracted attention on CPU to save VRAM.
+    Supported shapes:
+        [batch, heads, query_len, key_len]
+        [heads, query_len, key_len]
+        [batch, query_len, key_len]
+        [query_len, key_len]
+    """
+
+    if layer_attn.dim() == 4:
+        # [B, H, Q, K] -> [H, K]
+        return layer_attn[0, :, -1, :].float()
+
+    if layer_attn.dim() == 3:
+        # Ambiguous:
+        #   [H, Q, K]
+        #   [B, Q, K]
+        #
+        # If first dim is 1, treat it as batch.
+        if layer_attn.shape[0] == 1:
+            return layer_attn[0, -1, :].float().unsqueeze(0)
+
+        # Otherwise treat first dim as heads.
+        return layer_attn[:, -1, :].float()
+
+    if layer_attn.dim() == 2:
+        # [Q, K] -> [1, K]
+        return layer_attn[-1, :].float().unsqueeze(0)
+
+    return None
+
+
+# ============================================================
+# Main extraction
+# ============================================================
+
+def extract_image_attn_by_layer(
+    attentions,
+    input_ids,
+    current_step,
+    model=None,
+    tokenizer=None,
+    processor=None,
+    image_token_indices=None,
+    selected_layers=None,
+    keep_attn_on_cpu=True,
+):
+    """
+    Extract attention from the currently generated token to image-token positions.
 
     Returns:
         image_attn_by_layer:
-            Dict[layer_id] -> Tensor[num_heads, num_image_tokens]
+            dict[layer_idx -> Tensor[num_heads, num_image_tokens]]
 
         image_token_indices:
-            Resolved image-token indices.
+            resolved image-token positions
     """
 
-    if attentions is None or len(attentions) == 0:
-        raise ValueError("No attentions were provided.")
+    _ = current_step
 
-    num_layers = len(attentions)
-    layer_ids = _resolve_layer_ids(num_layers, selected_layers)
+    if attentions is None:
+        return None, image_token_indices
 
-    first_attn = attentions[layer_ids[0]]
-    first_token_attn = first_attn[0, :, -1, :]
+    if len(attentions) == 0:
+        return None, image_token_indices
 
-    if token_attn_key_len is None:
-        token_attn_key_len = first_token_attn.shape[-1]
+    if selected_layers is None:
+        selected_layers = [-1]
 
     if image_token_indices is None:
-        if model is None or tokenizer is None:
-            raise ValueError(
-                "model and tokenizer are required when image_token_indices is None."
-            )
-
         image_token_indices = resolve_image_token_indices(
             input_ids=input_ids,
-            token_attn_key_len=token_attn_key_len,
-            current_step=current_step,
             model=model,
             tokenizer=tokenizer,
+            processor=processor,
+            image_token_indices=image_token_indices,
         )
+
+    if not torch.is_tensor(image_token_indices):
+        image_token_indices = torch.tensor(
+            image_token_indices,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+
+    image_token_indices = image_token_indices.long()
 
     image_attn_by_layer: Dict[int, torch.Tensor] = {}
 
-    for layer_id in layer_ids:
-        attn = attentions[layer_id]
+    num_layers = len(attentions)
+    layer_ids = _resolve_layer_ids(
+        num_layers=num_layers,
+        selected_layers=selected_layers,
+    )
 
-        # [heads, key_len]
-        token_attn = attn[0, :, -1, :].detach()
+    expected_num_image_tokens = int(image_token_indices.numel())
 
-        valid_img_idx = image_token_indices[
-            image_token_indices < token_attn.shape[-1]
-        ]
+    for real_layer_idx in layer_ids:
+        layer_attn = _unwrap_layer_attention(attentions[real_layer_idx])
 
-        if len(valid_img_idx) == 0:
+        if layer_attn is None:
             continue
 
+        token_attn = _extract_last_query_attention(layer_attn)
+
+        if token_attn is None:
+            continue
+
+        # token_attn: [num_heads, key_len]
+        key_len = int(token_attn.shape[-1])
+
+        valid_image_indices = image_token_indices.to(token_attn.device)
+        valid_image_indices = valid_image_indices[
+            valid_image_indices < key_len
+        ]
+
+        if valid_image_indices.numel() == 0:
+            continue
+
+        # If the original prompt has many image tokens but only <=1 survives
+        # against the attention key axis, this is almost always cached-step
+        # attention, not full-prefix attention. Do not return fake grounding.
+        if expected_num_image_tokens > 1 and int(valid_image_indices.numel()) <= 1:
+            continue
+
+        image_attn = token_attn.index_select(
+            dim=-1,
+            index=valid_image_indices.long(),
+        )
+
+        # image_attn: [num_heads, num_valid_image_tokens]
+        image_attn = image_attn.float()
+
         if keep_attn_on_cpu:
-            token_attn_cpu = token_attn.float().cpu()
-            img_idx = valid_img_idx.cpu()
-            image_attn = token_attn_cpu[:, img_idx]
+            image_attn = image_attn.detach().cpu()
         else:
-            img_idx = valid_img_idx.to(token_attn.device)
-            image_attn = token_attn[:, img_idx]
+            image_attn = image_attn.detach()
 
-        image_attn_by_layer[int(layer_id)] = image_attn
+        image_attn_by_layer[int(real_layer_idx)] = image_attn
 
-    return image_attn_by_layer, image_token_indices.detach().cpu()
+    if len(image_attn_by_layer) == 0:
+        return None, image_token_indices
+
+    return image_attn_by_layer, image_token_indices
+
+
+# ============================================================
+# Layer-head selection
+# ============================================================
+
+def _ensure_head_token_attention(image_attn: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize attention to shape [num_heads, num_image_tokens].
+
+    Accepted:
+        [num_image_tokens]
+        [num_heads, num_image_tokens]
+    """
+
+    image_attn = image_attn.detach().float().cpu()
+
+    if image_attn.dim() == 1:
+        return image_attn.unsqueeze(0)
+
+    if image_attn.dim() == 2:
+        return image_attn
+
+    raise ValueError(
+        f"Expected image attention dim 1 or 2, got shape={tuple(image_attn.shape)}"
+    )
 
 
 def get_kept_lh_from_step(
     step: Dict[str, Any],
     image_grid_shape: Optional[Tuple[int, int]] = None,
     inputs: Optional[Dict[str, Any]] = None,
+    model=None,
     attn_sum_threshold: float = 0.49,
     bottom_row_threshold: float = 0.05,
     min_layer: int = 1,
@@ -247,41 +400,51 @@ def get_kept_lh_from_step(
         non-bottom-row head.
     """
 
-    image_attn_by_layer = step["image_attn_by_layer"]
+    image_attn_by_layer = step.get("image_attn_by_layer")
 
-    results = []
+    if image_attn_by_layer is None:
+        return []
+
+    results: List[Dict[str, Any]] = []
 
     for layer_id, image_attn in image_attn_by_layer.items():
-        image_attn = image_attn.detach().float().cpu()
-        num_heads = image_attn.shape[0]
+        image_attn = _ensure_head_token_attention(image_attn)
+        num_heads = int(image_attn.shape[0])
 
         for head_id in range(num_heads):
             attn_1d = image_attn[head_id]
             attn_sum = float(attn_1d.sum().item())
 
-            if attn_sum < attn_sum_threshold:
-                spatial_entropy_value = float("inf")
-                bottom_row_focus = False
-                num_components = 0
-            else:
-                attn_2d = image_attn_to_grid(
-                    attn_1d,
-                    image_grid_shape=image_grid_shape,
-                    inputs=inputs,
-                )
+            spatial_entropy_value = float("inf")
+            bottom_row_focus = False
+            num_components = 0
 
-                entropy_result = spatial_entropy(
-                    attn_2d,
-                    threshold=1e-3,
-                )
+            if int(attn_1d.numel()) > 1 and attn_sum >= attn_sum_threshold:
+                try:
+                    attn_2d = image_attn_to_grid(
+                        attn_1d,
+                        image_grid_shape=image_grid_shape,
+                        inputs=inputs,
+                        model=model,
+                    )
 
-                bottom_row_focus = bool(
-                    attn_2d.shape[0] > 0
-                    and (attn_2d[-1, :] > bottom_row_threshold).any()
-                )
+                    entropy_result = spatial_entropy(
+                        attn_2d,
+                        threshold=1e-3,
+                    )
 
-                spatial_entropy_value = float(entropy_result["spatial_entropy"])
-                num_components = int(entropy_result["num_components"])
+                    bottom_row_focus = bool(
+                        attn_2d.shape[0] > 0
+                        and (attn_2d[-1, :] > bottom_row_threshold).any()
+                    )
+
+                    spatial_entropy_value = float(entropy_result["spatial_entropy"])
+                    num_components = int(entropy_result["num_components"])
+
+                except Exception:
+                    spatial_entropy_value = float("inf")
+                    bottom_row_focus = False
+                    num_components = 0
 
             results.append(
                 {

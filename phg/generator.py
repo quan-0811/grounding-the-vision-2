@@ -1,3 +1,5 @@
+# phg/generator.py
+
 """
 Main PHG generator.
 
@@ -56,6 +58,42 @@ from phg.types import (
 )
 
 
+# ============================================================
+# Helpers
+# ============================================================
+
+def _strip_private_inputs(inputs: TensorDict) -> TensorDict:
+    """
+    Remove wrapper-private metadata before forwarding to model(...).
+
+    Qwen2-VL wrapper stores fields like:
+        _qwen_prompts
+        _qwen_image_paths
+        _qwen_images
+
+    These are needed for Qwen VCD rebuilding, but model.forward()
+    must never receive them.
+    """
+
+    return {
+        key: value
+        for key, value in inputs.items()
+        if not str(key).startswith("_")
+    }
+
+
+def _is_qwen_wrapper(wrapper: BaseLVLM) -> bool:
+    model_id = str(
+        getattr(
+            getattr(wrapper, "config", None),
+            "model_id",
+            "",
+        )
+    ).lower()
+
+    return "qwen2-vl" in model_id
+
+
 def _is_sentence_boundary_stop(output: Dict[str, Any]) -> bool:
     return output.get("stop_reason") in {
         "sentence_end_generated",
@@ -83,6 +121,10 @@ def _serialize_step_for_trace(step: Dict[str, Any]) -> Dict[str, Any]:
         "has_image_attn": step.get("image_attn_by_layer") is not None,
     }
 
+
+# ============================================================
+# Generator
+# ============================================================
 
 class PHGGenerator:
     """
@@ -140,6 +182,342 @@ class PHGGenerator:
         )
 
     @torch.inference_mode()
+    def _decode_segment_with_checkpoint_qwen_no_cache(
+        self,
+        wrapper: BaseLVLM,
+        base_inputs: TensorDict,
+        prefix_ids: Sequence[int],
+        force_first_token_id: Optional[int] = None,
+        enable_uncertainty_check: bool = True,
+        cd_base_inputs: Optional[TensorDict] = None,
+    ) -> Dict[str, Any]:
+        """
+        Qwen2-VL-safe PHG segment decoding.
+    
+        Why this exists:
+            Generic PHG uses cached token-by-token forwards.
+            Qwen2-VL is sensitive to cache_position / position_ids / M-ROPE handling.
+            A naive cached loop can select <|im_end|> too early.
+    
+        This version recomputes the full prefix at every step with use_cache=False.
+        It is slower, but much safer for validating Qwen greedy+PHG / DoLA+PHG.
+        """
+    
+        cfg = self.config
+    
+        if cfg.decoding_mode == "vcd" and cd_base_inputs is None:
+            raise RuntimeError(
+                "Qwen2-VL VCD+PHG requires cd_base_inputs. "
+                "Build it with wrapper.prepare_vcd_inputs() in generate_from_inputs()."
+            )
+    
+        base_inputs = _strip_private_inputs(base_inputs)
+    
+        model = _get_model(wrapper)
+        processor = _get_processor(wrapper)
+        tokenizer = _get_tokenizer(wrapper, processor)
+    
+        model.eval()
+    
+        stepwise_config = self._build_stepwise_config(
+            forced_token_ids=(
+                [int(force_first_token_id)]
+                if force_first_token_id is not None
+                else None
+            ),
+            enable_sentence_stop=cfg.stop_at_sentence_end,
+        )
+    
+        step_decoder = StepwiseDecoder(stepwise_config)
+    
+        forward_kwargs = step_decoder.build_forward_kwargs()
+        forward_kwargs = dict(forward_kwargs)
+        forward_kwargs["use_cache"] = False
+        forward_kwargs["return_dict"] = True
+    
+        if base_inputs["input_ids"].shape[0] != 1:
+            raise ValueError("PHG currently expects batch size 1.")
+    
+        eos_token_ids = _get_eos_token_ids(model, tokenizer)
+    
+        prefix_ids = normalize_prefix_ids(prefix_ids)
+    
+        generated_ids: List[int] = []
+        steps: List[Dict[str, Any]] = []
+    
+        checkpoint: Optional[CheckpointState] = None
+        candidates: Optional[List[CandidateRecord]] = None
+        candidate_records: List[Dict[str, Any]] = []
+    
+        has_uncertainty = False
+        first_uncertain_step = None
+        uncertain_steps: List[int] = []
+    
+        stop_reason = None
+        image_token_indices = None
+    
+        for step_idx in range(cfg.max_new_tokens):
+            forced_first_step = (
+                force_first_token_id is not None
+                and step_idx == 0
+            )
+    
+            # --------------------------------------------------------
+            # 1. Recompute full prefix BEFORE selecting next token.
+            # --------------------------------------------------------
+            select_inputs = append_generated_ids_to_inputs(
+                base_inputs,
+                prefix_ids + generated_ids,
+            )
+            select_inputs = _strip_private_inputs(select_inputs)
+    
+            select_outputs = model(
+                **select_inputs,
+                output_attentions=False,
+                **forward_kwargs,
+            )
+            
+            cd_select_outputs = None
+            
+            if cfg.decoding_mode == "vcd":
+                select_cd_inputs = append_generated_ids_to_inputs(
+                    cd_base_inputs,
+                    prefix_ids + generated_ids,
+                )
+                select_cd_inputs = _strip_private_inputs(select_cd_inputs)
+            
+                cd_select_outputs = model(
+                    **select_cd_inputs,
+                    output_attentions=False,
+                    **forward_kwargs,
+                )
+            
+            (
+                next_token,
+                selection_logits,
+                selected_token_prob,
+                max_prob,
+                entropy,
+                dola_premature_layer,
+                clean_token_prob,
+                cd_token_prob,
+            ) = step_decoder._select_next_token(
+                model=model,
+                outputs=select_outputs,
+                cd_outputs=cd_select_outputs,
+                generated_token_ids=prefix_ids + generated_ids,
+                forced_token_id=(
+                    int(force_first_token_id)
+                    if forced_first_step
+                    else None
+                ),
+            )
+    
+            is_low_confidence = bool(
+                enable_uncertainty_check
+                and not forced_first_step
+                and max_prob < cfg.accumulate_prob
+            )
+    
+            if is_low_confidence:
+                has_uncertainty = True
+                uncertain_steps.append(step_idx)
+    
+                if first_uncertain_step is None:
+                    first_uncertain_step = step_idx
+    
+            forced_boundary_token = None
+    
+            should_store_uncertainty = (
+                is_low_confidence
+                and (
+                    not cfg.checkpoint_once
+                    or checkpoint is None
+                )
+            )
+    
+            if should_store_uncertainty:
+                current_candidates, candidate_max_prob = select_candidate_tokens(
+                    logits=selection_logits,
+                    tokenizer=tokenizer,
+                    top_k=cfg.top_k,
+                    accumulate_prob=cfg.accumulate_prob,
+                )
+    
+                candidate_records.append(
+                    {
+                        "step": int(step_idx),
+                        "max_prob": float(candidate_max_prob),
+                        "threshold": float(cfg.accumulate_prob),
+                        "candidates": candidates_to_trace(current_candidates),
+                        "dola_premature_layer": dola_premature_layer,
+                    }
+                )
+    
+                if candidates is None:
+                    candidates = current_candidates
+    
+                if checkpoint is None:
+                    checkpoint = build_checkpoint(
+                        base_inputs=base_inputs,
+                        prefix_ids=prefix_ids,
+                        generated_ids=generated_ids,
+                        tokenizer=tokenizer,
+                    )
+    
+                if cfg.stop_if_sentence_end_in_candidates:
+                    boundary_candidate = first_boundary_candidate(
+                        current_candidates,
+                        tokenizer=tokenizer,
+                        eos_token_ids=eos_token_ids,
+                    )
+    
+                    if boundary_candidate is not None:
+                        forced_boundary_token = int(boundary_candidate.token_id)
+                        stop_reason = "sentence_end_or_eos_in_candidates"
+    
+                if cfg.debug:
+                    print(
+                        f"[PHG uncertainty] step={step_idx}, "
+                        f"max_prob={candidate_max_prob:.4f}, "
+                        f"candidates={candidates_to_trace(current_candidates)}"
+                    )
+    
+            if forced_boundary_token is not None:
+                next_token = torch.tensor(
+                    [[int(forced_boundary_token)]],
+                    dtype=torch.long,
+                    device=base_inputs["input_ids"].device,
+                )
+    
+            token_id = int(next_token[0, 0].item())
+            token_text = _decode_token(tokenizer, token_id)
+    
+            generated_ids.append(token_id)
+    
+            # --------------------------------------------------------
+            # 2. Recompute full prefix AFTER appending selected token.
+            #    This gives attention for the selected token as last query.
+            # --------------------------------------------------------
+            attn_inputs = append_generated_ids_to_inputs(
+                base_inputs,
+                prefix_ids + generated_ids,
+            )
+            attn_inputs = _strip_private_inputs(attn_inputs)
+    
+            attn_outputs = model(
+                **attn_inputs,
+                output_attentions=True,
+                **forward_kwargs,
+            )
+    
+            image_attn_by_layer = None
+    
+            if attn_outputs.attentions is not None:
+                from grounding.attention import extract_image_attn_by_layer
+    
+                image_attn_by_layer, image_token_indices = extract_image_attn_by_layer(
+                    attentions=attn_outputs.attentions,
+                    input_ids=attn_inputs["input_ids"],
+                    current_step=step_idx,
+                    model=model,
+                    tokenizer=tokenizer,
+                    processor=processor,
+                    image_token_indices=image_token_indices,
+                    selected_layers=cfg.selected_layers,
+                    keep_attn_on_cpu=cfg.keep_attn_on_cpu,
+                )
+    
+            step_dict = {
+                "step": int(step_idx),
+                "token_id": int(token_id),
+                "token_text": token_text,
+                "max_prob": float(max_prob),
+                "selected_token_prob": float(selected_token_prob),
+                "entropy": float(entropy),
+                "is_low_confidence": bool(is_low_confidence),
+                "decoding_mode": cfg.decoding_mode,
+                "dola_premature_layer": dola_premature_layer,
+                "clean_token_prob": clean_token_prob,
+                "cd_token_prob": cd_token_prob,
+                "image_attn_by_layer": image_attn_by_layer,
+            }
+    
+            steps.append(step_dict)
+    
+            if cfg.debug:
+                print(
+                    f"[Qwen PHG step {step_idx}] "
+                    f"token={repr(token_text)} "
+                    f"prob={float(selected_token_prob):.4f} "
+                    f"max={float(max_prob):.4f}"
+                )
+    
+            if stop_reason is not None:
+                break
+    
+            if token_id in eos_token_ids:
+                stop_reason = "eos_generated"
+                break
+    
+            decoded_text_raw = tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            )
+    
+            if (
+                cfg.stop_at_sentence_end
+                and len(generated_ids) >= cfg.min_new_tokens
+                and re.search(r"([.!?。！？]\s*|\n+|\r+)$", decoded_text_raw)
+            ):
+                stop_reason = "sentence_end_generated"
+                break
+    
+        generated_text = tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        ).strip()
+    
+        full_generated_ids = prefix_ids + generated_ids
+    
+        full_generated_text = tokenizer.decode(
+            full_generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        ).strip()
+    
+        if stop_reason is None:
+            stop_reason = "max_new_tokens_reached"
+    
+        return {
+            "generated_text": generated_text,
+            "generated_ids": generated_ids,
+    
+            "prefix_ids": prefix_ids,
+            "full_generated_ids": full_generated_ids,
+            "full_generated_text": full_generated_text,
+    
+            "confidence_path": "uncertainty" if has_uncertainty else "certainty",
+            "has_uncertainty": has_uncertainty,
+            "first_uncertain_step": first_uncertain_step,
+            "uncertain_steps": uncertain_steps,
+    
+            "stop_reason": stop_reason,
+            "steps": steps,
+    
+            "checkpoint": checkpoint,
+            "candidates": candidates,
+            "candidate_records": candidate_records,
+    
+            "step_summaries": [
+                _serialize_step_for_trace(step)
+                for step in steps
+            ],
+        }
+
+    @torch.inference_mode()
     def _decode_segment_with_checkpoint(
         self,
         wrapper: BaseLVLM,
@@ -147,18 +525,29 @@ class PHGGenerator:
         prefix_ids: Sequence[int],
         force_first_token_id: Optional[int] = None,
         enable_uncertainty_check: bool = True,
+        cd_base_inputs: Optional[TensorDict] = None,
     ) -> Dict[str, Any]:
-        """
-        Decode one sentence/segment.
-
-        This records:
-            - token steps
-            - image attention
-            - first low-confidence checkpoint
-            - candidates at checkpoint
-        """
-
         cfg = self.config
+    
+        if _is_qwen_wrapper(wrapper):    
+            return self._decode_segment_with_checkpoint_qwen_no_cache(
+                wrapper=wrapper,
+                base_inputs=base_inputs,
+                prefix_ids=prefix_ids,
+                force_first_token_id=force_first_token_id,
+                enable_uncertainty_check=enable_uncertainty_check,
+                cd_base_inputs=cd_base_inputs,
+            )
+
+        if cfg.decoding_mode == "vcd" and _is_qwen_wrapper(wrapper):
+            raise RuntimeError(
+                "Qwen2-VL VCD+PHG is not implemented in generic PHG. "
+                "Qwen normal VCD uses decoding/qwen_vcd.py with "
+                "model.generate() + LogitsProcessor, while PHG requires "
+                "stepwise candidate branching."
+            )
+
+        base_inputs = _strip_private_inputs(base_inputs)
 
         model = _get_model(wrapper)
         processor = _get_processor(wrapper)
@@ -182,6 +571,7 @@ class PHGGenerator:
             base_inputs,
             prefix_ids,
         )
+        working_inputs = _strip_private_inputs(working_inputs)
 
         if working_inputs["input_ids"].shape[0] != 1:
             raise ValueError("PHG currently expects batch size 1.")
@@ -202,9 +592,12 @@ class PHGGenerator:
                 image_tensor_key=cfg.image_tensor_key,
                 noise_step=cfg.noise_step,
             )
+            cd_inputs = _strip_private_inputs(cd_inputs)
+
+        prefill_inputs = _strip_private_inputs(working_inputs)
 
         prefill_outputs = model(
-            **working_inputs,
+            **prefill_inputs,
             output_attentions=False,
             **forward_kwargs,
         )
@@ -212,13 +605,16 @@ class PHGGenerator:
         cd_prefill_outputs = None
 
         if cfg.decoding_mode == "vcd":
+            cd_prefill_inputs = _strip_private_inputs(cd_inputs)
+
             cd_prefill_outputs = model(
-                **cd_inputs,
+                **cd_prefill_inputs,
                 output_attentions=False,
                 **forward_kwargs,
             )
 
         past_key_values = prefill_outputs.past_key_values
+
         past_key_values_cd = (
             cd_prefill_outputs.past_key_values
             if cd_prefill_outputs is not None
@@ -368,10 +764,14 @@ class PHGGenerator:
                 dim=-1,
             )
 
+            step_inputs = {
+                "input_ids": next_token,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+            }
+
             step_outputs = model(
-                input_ids=next_token,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                **step_inputs,
                 output_attentions=True,
                 **forward_kwargs,
             )
@@ -379,10 +779,14 @@ class PHGGenerator:
             step_cd_outputs = None
 
             if cfg.decoding_mode == "vcd":
+                step_cd_inputs = {
+                    "input_ids": next_token,
+                    "attention_mask": attention_mask,
+                    "past_key_values": past_key_values_cd,
+                }
+
                 step_cd_outputs = model(
-                    input_ids=next_token,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values_cd,
+                    **step_cd_inputs,
                     output_attentions=False,
                     **forward_kwargs,
                 )
@@ -396,13 +800,40 @@ class PHGGenerator:
 
             if step_outputs.attentions is not None:
                 from grounding.attention import extract_image_attn_by_layer
-
+            
+                attn_outputs = step_outputs
+                attn_input_ids = input_ids
+            
+                # Qwen2-VL cached step attention may expose only a tiny key window,
+                # which makes image attention length become 1. Recompute the full
+                # prefix with use_cache=False only for attention extraction.
+                if _is_qwen_wrapper(wrapper):
+                    attn_inputs = append_generated_ids_to_inputs(
+                        base_inputs,
+                        prefix_ids + generated_ids,
+                    )
+                    attn_inputs = _strip_private_inputs(attn_inputs)
+            
+                    # Important: no cache for this attention-only recompute.
+                    attn_forward_kwargs = dict(forward_kwargs)
+                    attn_forward_kwargs["use_cache"] = False
+                    attn_forward_kwargs["return_dict"] = True
+            
+                    attn_outputs = model(
+                        **attn_inputs,
+                        output_attentions=True,
+                        **attn_forward_kwargs,
+                    )
+            
+                    attn_input_ids = attn_inputs["input_ids"]
+            
                 image_attn_by_layer, image_token_indices = extract_image_attn_by_layer(
-                    attentions=step_outputs.attentions,
-                    input_ids=input_ids,
+                    attentions=attn_outputs.attentions,
+                    input_ids=attn_input_ids,
                     current_step=step_idx,
                     model=model,
                     tokenizer=tokenizer,
+                    processor=processor,
                     image_token_indices=image_token_indices,
                     selected_layers=cfg.selected_layers,
                     keep_attn_on_cpu=cfg.keep_attn_on_cpu,
@@ -504,11 +935,38 @@ class PHGGenerator:
 
         cfg = self.config
 
+        # Keep original prepared inputs because Qwen VCD needs private metadata:
+        # _qwen_prompts, _qwen_image_paths, _qwen_images
+        original_inputs = inputs
+        
         model = _get_model(wrapper)
         processor = _get_processor(wrapper)
         tokenizer = _get_tokenizer(wrapper, processor)
-
-        base_inputs = _move_inputs_to_model(inputs, model)
+        
+        base_inputs = _move_inputs_to_model(
+            _strip_private_inputs(original_inputs),
+            model,
+        )
+        base_inputs = _strip_private_inputs(base_inputs)
+        
+        cd_base_inputs = None
+        
+        if cfg.decoding_mode == "vcd" and _is_qwen_wrapper(wrapper):
+            if not hasattr(wrapper, "prepare_vcd_inputs"):
+                raise RuntimeError(
+                    "Qwen2-VL VCD+PHG requires wrapper.prepare_vcd_inputs()."
+                )
+        
+            cd_inputs_cpu = wrapper.prepare_vcd_inputs(
+                original_inputs,
+                noise_step=cfg.noise_step,
+            )
+        
+            cd_base_inputs = _move_inputs_to_model(
+                _strip_private_inputs(cd_inputs_cpu),
+                model,
+            )
+            cd_base_inputs = _strip_private_inputs(cd_base_inputs)
 
         accepted_generated_ids = normalize_prefix_ids(cfg.prefix_ids)
 
@@ -538,6 +996,7 @@ class PHGGenerator:
                 prefix_ids=accepted_generated_ids,
                 force_first_token_id=None,
                 enable_uncertainty_check=True,
+                cd_base_inputs=cd_base_inputs,
             )
 
             round_outputs.append(current_output)
@@ -596,8 +1055,6 @@ class PHGGenerator:
                 checkpoint_pos = int(checkpoint.position)
                 checkpoint_generated_ids = list(checkpoint.generated_ids)
 
-            # Process certain prefix before checkpoint:
-            # [memory.processed_prefix_len, checkpoint_pos)
             prefix_segment_ids, prefix_segment_steps = extract_output_segment_by_abs_range(
                 output=current_output,
                 start_abs=memory.processed_prefix_len,
@@ -620,7 +1077,6 @@ class PHGGenerator:
                 print("[checkpoint_pos]", checkpoint_pos)
                 print("[prefix_score]", prefix_score.to_trace())
 
-            # If boundary among candidates was selected, accept shortened output.
             if current_output["stop_reason"] == "sentence_end_or_eos_in_candidates":
                 accepted_generated_ids = current_output["full_generated_ids"]
                 memory.set_processed_prefix_len(len(accepted_generated_ids))
@@ -677,6 +1133,7 @@ class PHGGenerator:
                     prefix_ids=checkpoint_generated_ids,
                     force_first_token_id=cand.token_id,
                     enable_uncertainty_check=True,
+                    cd_base_inputs=cd_base_inputs,
                 )
 
                 branch_score = score_segment(
@@ -701,7 +1158,7 @@ class PHGGenerator:
 
             selected_branch = sorted(
                 branches,
-                key=lambda b: b.ranking_tuple,
+                key=lambda branch: branch.ranking_tuple,
             )[0]
 
             selected_output = selected_branch.output
@@ -817,13 +1274,23 @@ class PHGGenerator:
                 **prepare_kwargs,
             )
 
+            sample_id = sample[id_key]
+
+            try:
+                sample_id = int(sample_id)
+            except Exception:
+                pass
+
             row: Dict[str, Any] = {
-                id_key: int(sample[id_key]),
+                id_key: sample_id,
                 caption_key: output.final_text,
             }
 
             if include_prompt:
-                row[prompt_key] = sample.get(prompt_key, "Describe this image.")
+                row[prompt_key] = sample.get(
+                    prompt_key,
+                    "Describe this image.",
+                )
 
             if include_trace:
                 row["objects"] = output.objects
@@ -835,12 +1302,17 @@ class PHGGenerator:
         return rows
 
 
+# ============================================================
+# Public functions
+# ============================================================
+
 def generate_phg_from_inputs(
     wrapper: BaseLVLM,
     inputs: TensorDict,
     config: Optional[PHGConfig] = None,
 ) -> PHGOutput:
     generator = PHGGenerator(config)
+
     return generator.generate_from_inputs(
         wrapper=wrapper,
         inputs=inputs,
@@ -857,6 +1329,7 @@ def generate_phg_batch(
     **prepare_kwargs: Any,
 ) -> PHGOutput:
     generator = PHGGenerator(config)
+
     return generator.generate_batch(
         wrapper=wrapper,
         image_paths=image_paths,
@@ -881,6 +1354,7 @@ def generate_phg_samples(
     **prepare_kwargs: Any,
 ) -> List[Dict[str, Any]]:
     generator = PHGGenerator(config)
+
     return generator.generate_samples(
         wrapper=wrapper,
         samples=samples,

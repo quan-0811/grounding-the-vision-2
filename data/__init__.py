@@ -6,12 +6,8 @@ from data.coco import (
     save_coco_sample_ids,
 )
 
-from data.visual_genome import (
-    load_visual_genome,
-    resolve_vg_image_path,
-)
-
 from data.amber import (
+    find_amber_images,
     load_amber,
 )
 

@@ -1,13 +1,4 @@
-"""
-Image-level noise utilities for VCD.
-
-Important:
-    For Qwen2-VL, do NOT add noise directly to processed pixel_values.
-    Instead:
-        raw PIL image -> add noise -> Qwen processor -> pixel_values
-
-This keeps the contrastive image branch closer to what Qwen expects.
-"""
+# utils/image_noise.py
 
 from __future__ import annotations
 
@@ -22,12 +13,7 @@ def get_diffusion_coefficients(
     noise_step: int = 500,
     device: Optional[torch.device] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return sqrt(alpha_bar_t), sqrt(1 - alpha_bar_t).
-    """
-
     noise_step = int(max(0, min(999, noise_step)))
-
     device = device or torch.device("cpu")
 
     betas = torch.linspace(
@@ -53,12 +39,6 @@ def add_diffusion_noise_to_tensor(
     tensor: torch.Tensor,
     noise_step: int = 500,
 ) -> torch.Tensor:
-    """
-    Add diffusion noise to tensor.
-
-    Used for LLaVA-style pixel_values.
-    """
-
     orig_dtype = tensor.dtype
     device = tensor.device
 
@@ -79,12 +59,6 @@ def add_diffusion_noise_to_pil(
     image: Image.Image,
     noise_step: int = 500,
 ) -> Image.Image:
-    """
-    Add diffusion-style Gaussian noise to a raw PIL image.
-
-    Used for Qwen2-VL VCD.
-    """
-
     image = image.convert("RGB")
 
     array = np.asarray(image).astype("float32") / 255.0

@@ -56,6 +56,11 @@ def build_decoder_config(
 
     raise ValueError(f"Unknown decoding name: {decoding_name}")
 
+def _is_qwen2vl_wrapper(wrapper) -> bool:
+    model_id = getattr(getattr(wrapper, "config", None), "model_id", "")
+    model_id = str(model_id).lower()
+
+    return "qwen2-vl" in model_id
 
 def generate_samples_with_decoder(
     decoding_name: str,
@@ -98,8 +103,18 @@ def generate_samples_with_decoder(
         )
 
     if name == "vcd":
+        if _is_qwen2vl_wrapper(wrapper):
+            from decoding.qwen_vcd import generate_qwen_vcd_samples
+    
+            return generate_qwen_vcd_samples(
+                wrapper=wrapper,
+                samples=samples,
+                config=config,
+                **kwargs,
+            )
+    
         from decoding.vcd import generate_vcd_samples
-
+    
         return generate_vcd_samples(
             wrapper=wrapper,
             samples=samples,

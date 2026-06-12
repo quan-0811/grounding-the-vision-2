@@ -45,7 +45,6 @@ SUPPORTED_DECODINGS = {
 SUPPORTED_DATASETS = {
     "coco_val2017",
     "amber",
-    "visual_genome",
 }
 
 
@@ -121,24 +120,19 @@ def load_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
             image_dir=args.coco_image_dir,
             annotation_path=args.coco_annotation_path,
             max_samples=args.max_samples,
+            prompt=args.prompt,
         )
 
     elif args.dataset == "amber":
         from data.amber import load_amber
 
         samples = load_amber(
+            root=args.amber_root,
             image_dir=args.amber_image_dir,
+            query_path=args.amber_query_path,
             annotation_path=args.amber_annotation_path,
             max_samples=args.max_samples,
-        )
-
-    elif args.dataset == "visual_genome":
-        from data.visual_genome import load_visual_genome
-
-        samples = load_visual_genome(
-            vg_root=args.vg_root,
-            objects_path=args.vg_objects_path,
-            max_samples=args.max_samples,
+            prompt=args.prompt,
         )
 
     else:
@@ -215,22 +209,28 @@ def build_normal_decoder_config(
         }
 
     elif decoding == "vcd":
-        if model_name != "llava15_7b":
+        if model_name not in {"llava15_7b", "qwen2vl_7b"}:
             raise ValueError(
-                f"VCD is currently enabled only for llava15_7b. Got {model_name}."
+                f"VCD is enabled only for llava15_7b and qwen2vl_7b. Got {model_name}."
             )
-
+    
         config_kwargs = {
             "max_new_tokens": args.max_new_tokens,
             "cd_alpha": args.cd_alpha,
             "cd_beta": args.cd_beta,
             "noise_step": args.noise_step,
             "do_sample": args.do_sample,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "temperature": args.temperature,
             "use_cache": True,
         }
+    
+        if args.do_sample:
+            config_kwargs.update(
+                {
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "top_k": args.top_k,
+                }
+            )
 
     else:
         raise ValueError(f"Unknown decoding: {decoding}")
@@ -320,6 +320,9 @@ def add_row_metadata(
     out["decoding"] = args.decoding
     out["dataset"] = args.dataset
 
+    if args.dataset == "amber" and "caption" in out:
+        out["response"] = out["caption"]
+
     return out
 
 
@@ -393,12 +396,12 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.dataset not in SUPPORTED_DATASETS:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    if args.model == "qwen2vl_7b" and args.decoding in {"vcd", "vcd_phg"}:
+    if args.model == "qwen2vl_7b" and args.decoding == "vcd_phg":
         raise ValueError(
-            "Qwen2-VL + VCD/VCD-PHG is disabled. "
-            "Use greedy, dola_low, greedy_phg, or dola_low_phg."
+            "Qwen2-VL + VCD-PHG is still disabled. "
+            "Only normal Qwen2-VL VCD is re-enabled through LogitsProcessor."
         )
-
+        
     if args.model == "internvl2_8b" and args.decoding != "greedy":
         raise ValueError(
             "InternVL2 currently supports greedy only."
@@ -455,6 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phg-ads-foreground-ratio", type=float, default=0.10)
     parser.add_argument("--phg-debug", action="store_true")
     parser.add_argument("--include-trace", action="store_true")
+        
     parser.add_argument(
         "--selected-layers",
         type=parse_selected_layers,
@@ -469,23 +473,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--coco-annotation-path",
         default="data/coco2017/annotations/instances_val2017.json",
     )
-
+    parser.add_argument(
+        "--amber-root",
+        default="data/amber",
+    )
     parser.add_argument(
         "--amber-image-dir",
-        default="data/amber/images",
+        default=None,
+    )
+    parser.add_argument(
+        "--amber-query-path",
+        default="data/amber/query/query_generative.json",
     )
     parser.add_argument(
         "--amber-annotation-path",
         default="data/amber/annotations.json",
-    )
-
-    parser.add_argument(
-        "--vg-root",
-        default="data/visual_genome",
-    )
-    parser.add_argument(
-        "--vg-objects-path",
-        default="data/visual_genome/VisualGenome_task/objects.json",
     )
 
     parser.add_argument("--qwen-min-pixels", type=int, default=None)

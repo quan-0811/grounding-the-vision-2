@@ -1,14 +1,27 @@
+# decoding/vcd.py
+
 """
 Visual Contrastive Decoding for normal LVLM generation.
 
-Revised design:
-    - If wrapper has prepare_vcd_inputs(), use it.
-      This is required for Qwen2-VL.
-    - Otherwise, fallback to tensor-level pixel_values noise.
-      This works for LLaVA.
-    - No min_new_tokens.
-    - No EOS forcing.
-    - Conservative clean-guided VCD.
+This file is the generic/manual VCD implementation.
+
+Intended use:
+    - LLaVA-style models where manual token-by-token decoding with
+      past_key_values is stable.
+
+Not intended use:
+    - Qwen2-VL.
+      Qwen2-VL requires its own VCD path in decoding/qwen_vcd.py because
+      it depends on Qwen's official generate path, dynamic visual tokens,
+      attention masks, and prepare_inputs_for_generation() / M-ROPE handling.
+
+Design:
+    - Tensor-level pixel_values noise.
+    - Manual clean/CD forward passes.
+    - Standard VCD scoring:
+          score = (1 + alpha) log p_clean - alpha log p_cd
+    - Standard VCD plausibility mask controlled by cd_beta:
+          p_clean(token) >= beta * max_token p_clean(token)
 """
 
 from __future__ import annotations
@@ -33,9 +46,8 @@ class VCDConfig:
     max_new_tokens: int = 256
     use_cache: bool = True
 
-    # Conservative defaults.
-    cd_alpha: float = 0.2
-    cd_beta: float = 0.5
+    cd_alpha: float = 1.0
+    cd_beta: float = 0.1
     noise_step: int = 500
 
     do_sample: bool = False
@@ -44,11 +56,6 @@ class VCDConfig:
     top_k: Optional[int] = None
 
     image_tensor_key: str = "pixel_values"
-
-    # Clean branch safety.
-    clean_confidence_gate: Optional[float] = 0.35
-    fallback_to_clean: bool = True
-    fallback_clean_prob_ratio: float = 0.30
 
     extra_forward_kwargs: Dict[str, Any] = field(default_factory=dict)
 
@@ -70,31 +77,38 @@ def add_diffusion_noise(
 def apply_vcd_logits(
     clean_logits: torch.Tensor,
     cd_logits: torch.Tensor,
-    cd_alpha: float = 0.2,
-    cd_beta: float = 0.5,
+    cd_alpha: float = 1.0,
+    cd_beta: float = 0.1,
 ) -> torch.Tensor:
     """
-    Conservative VCD in log-probability space.
+    Standard VCD in log-probability space.
 
     score = (1 + alpha) log p_clean - alpha log p_cd
 
-    Then keep only tokens plausible under clean branch:
-        p_clean(token) >= beta * max_clean_prob
+    Plausibility mask:
+        p_clean(token) >= beta * max_token p_clean(token)
+
+    No model-specific token filtering.
     """
 
     cd_alpha = float(cd_alpha)
+    cd_beta = float(max(cd_beta, 1e-12))
 
     if cd_alpha <= 0:
         return clean_logits.float()
 
-    cd_beta = float(max(cd_beta, 1e-8))
-
     clean_log_probs = F.log_softmax(clean_logits.float(), dim=-1)
     cd_log_probs = F.log_softmax(cd_logits.float(), dim=-1)
 
-    vcd_scores = (1.0 + cd_alpha) * clean_log_probs - cd_alpha * cd_log_probs
+    vcd_scores = (
+        (1.0 + cd_alpha) * clean_log_probs
+        - cd_alpha * cd_log_probs
+    )
 
-    max_clean_log_prob = clean_log_probs.max(dim=-1, keepdim=True).values
+    max_clean_log_prob = clean_log_probs.max(
+        dim=-1,
+        keepdim=True,
+    ).values
 
     cutoff = max_clean_log_prob + torch.log(
         torch.tensor(
@@ -106,77 +120,21 @@ def apply_vcd_logits(
 
     plausible = clean_log_probs >= cutoff
 
-    masked_scores = vcd_scores.masked_fill(~plausible, -float("inf"))
-
-    all_inf = torch.isinf(masked_scores).all(dim=-1, keepdim=True)
-
-    return torch.where(all_inf, clean_logits.float(), masked_scores)
-
-
-def apply_clean_confidence_gate(
-    clean_logits: torch.Tensor,
-    vcd_logits: torch.Tensor,
-    gate: Optional[float],
-) -> torch.Tensor:
-    """
-    If clean branch is already confident, use clean logits.
-
-    This prevents VCD from damaging fluent high-confidence tokens.
-    """
-
-    if gate is None:
-        return vcd_logits
-
-    clean_probs = F.softmax(clean_logits.float(), dim=-1)
-    clean_max = clean_probs.max(dim=-1, keepdim=True).values
-
-    use_clean = clean_max >= float(gate)
-
-    return torch.where(use_clean, clean_logits.float(), vcd_logits)
-
-
-def maybe_fallback_to_clean(
-    selected_token: torch.Tensor,
-    clean_logits: torch.Tensor,
-    fallback_to_clean: bool,
-    fallback_clean_prob_ratio: float,
-    do_sample: bool,
-) -> torch.Tensor:
-    """
-    If selected VCD token is too weak under the clean branch,
-    replace with clean argmax.
-    """
-
-    if not fallback_to_clean:
-        return selected_token
-
-    if do_sample:
-        return selected_token
-
-    clean_probs = F.softmax(clean_logits.float(), dim=-1)
-
-    selected_clean_prob = clean_probs.gather(
-        dim=-1,
-        index=selected_token,
+    vcd_scores = vcd_scores.masked_fill(
+        ~plausible,
+        -float("inf"),
     )
 
-    max_clean_prob = clean_probs.max(dim=-1, keepdim=True).values
-
-    too_weak = selected_clean_prob < (
-        float(fallback_clean_prob_ratio) * max_clean_prob
-    )
-
-    clean_argmax = torch.argmax(
-        clean_logits,
+    all_inf = torch.isinf(vcd_scores).all(
         dim=-1,
         keepdim=True,
     )
 
-    return torch.where(
-        too_weak,
-        clean_argmax,
-        selected_token,
-    )
+    if all_inf.any():
+        fallback = clean_logits.float()
+        vcd_scores = torch.where(all_inf, fallback, vcd_scores)
+
+    return vcd_scores
 
 
 def _get_model(wrapper: BaseLVLM) -> Any:
@@ -204,17 +162,24 @@ def _get_model_device_and_dtype(model: Any) -> tuple[torch.device, torch.dtype]:
     return param.device, param.dtype
 
 
+def _is_qwen_wrapper(wrapper: BaseLVLM) -> bool:
+    model_id = str(
+        getattr(
+            getattr(wrapper, "config", None),
+            "model_id",
+            "",
+        )
+    ).lower()
+
+    return "qwen2-vl" in model_id or "qwen2.5-vl" in model_id
+
+
 def _strip_private_inputs(inputs: TensorDict) -> TensorDict:
-    """
-    Remove private metadata and unsupported non-tensor fields.
-    """
-
-    allowed_non_tensor_keys = set()
-
     allowed_tensor_keys = {
         "input_ids",
         "attention_mask",
         "pixel_values",
+        "image_sizes",
         "image_grid_thw",
         "pixel_values_videos",
         "video_grid_thw",
@@ -225,16 +190,11 @@ def _strip_private_inputs(inputs: TensorDict) -> TensorDict:
     out: Dict[str, Any] = {}
 
     for key, value in inputs.items():
-        if key.startswith("_"):
+        if str(key).startswith("_"):
             continue
 
         if key in allowed_tensor_keys:
             out[key] = value
-            continue
-
-        if key in allowed_non_tensor_keys:
-            out[key] = value
-            continue
 
     return out
 
@@ -275,7 +235,7 @@ def _make_tensor_noised_inputs(
     noised: Dict[str, Any] = {}
 
     for key, value in inputs.items():
-        if key.startswith("_"):
+        if str(key).startswith("_"):
             continue
 
         if torch.is_tensor(value):
@@ -298,17 +258,16 @@ def _make_contrastive_inputs(
     noise_step: int,
 ) -> TensorDict:
     """
-    Build contrastive branch.
+    Build contrastive branch for generic/LLaVA VCD.
 
-    Priority:
-        1. wrapper.prepare_vcd_inputs()
-        2. tensor-level pixel_values noise
+    Qwen2-VL must not use this path.
+    Qwen2-VL is dispatched to decoding/qwen_vcd.py by decoding/registry.py.
     """
 
-    if hasattr(wrapper, "prepare_vcd_inputs"):
-        return wrapper.prepare_vcd_inputs(
-            clean_inputs_cpu,
-            noise_step=noise_step,
+    if _is_qwen_wrapper(wrapper):
+        raise RuntimeError(
+            "Qwen2-VL must not use decoding.vcd.VCDDecoder. "
+            "Use decoding.qwen_vcd through decoding.registry instead."
         )
 
     return _make_tensor_noised_inputs(
@@ -362,7 +321,10 @@ def _decode_new_tokens(
     new_token_ids: torch.Tensor,
 ) -> List[str]:
     if hasattr(wrapper, "batch_decode"):
-        return [x.strip() for x in wrapper.batch_decode(new_token_ids)]
+        return [
+            text.strip()
+            for text in wrapper.batch_decode(new_token_ids)
+        ]
 
     if hasattr(processor, "batch_decode"):
         captions = processor.batch_decode(
@@ -370,7 +332,8 @@ def _decode_new_tokens(
             skip_special_tokens=True,
             clean_up_tokenization_spaces=True,
         )
-        return [x.strip() for x in captions]
+
+        return [text.strip() for text in captions]
 
     captions = processor.tokenizer.batch_decode(
         new_token_ids,
@@ -378,7 +341,7 @@ def _decode_new_tokens(
         clean_up_tokenization_spaces=True,
     )
 
-    return [x.strip() for x in captions]
+    return [text.strip() for text in captions]
 
 
 def _build_generation_output(
@@ -455,7 +418,6 @@ class VCDDecoder:
 
         model.eval()
 
-        # Keep CPU/private version for wrapper.prepare_vcd_inputs().
         clean_inputs_cpu = inputs
 
         cd_inputs_cpu = _make_contrastive_inputs(
@@ -488,7 +450,10 @@ class VCDDecoder:
         next_input_ids = input_ids
         next_input_ids_cd = cd_inputs["input_ids"]
 
-        eos_token_ids = _get_eos_token_ids(model, processor)
+        eos_token_ids = _get_eos_token_ids(
+            model=model,
+            processor=processor,
+        )
 
         fallback_token_id = _get_fallback_token_id(
             processor=processor,
@@ -501,7 +466,9 @@ class VCDDecoder:
             device=input_ids.device,
         )
 
-        forward_kwargs = self.build_forward_kwargs(**override_forward_kwargs)
+        forward_kwargs = self.build_forward_kwargs(
+            **override_forward_kwargs,
+        )
 
         for step_idx in range(cfg.max_new_tokens):
             if step_idx == 0:
@@ -515,7 +482,7 @@ class VCDDecoder:
                 }
 
                 cd_step_inputs = {
-                    "input_ids": next_input_ids,
+                    "input_ids": next_input_ids_cd,
                     "attention_mask": attention_mask,
                     "past_key_values": past_key_values_cd,
                 }
@@ -543,12 +510,6 @@ class VCDDecoder:
                 cd_beta=cfg.cd_beta,
             )
 
-            vcd_logits = apply_clean_confidence_gate(
-                clean_logits=clean_logits,
-                vcd_logits=vcd_logits,
-                gate=cfg.clean_confidence_gate,
-            )
-
             selection_logits = prepare_logits_for_selection(
                 logits=vcd_logits,
                 generated_token_ids=[],
@@ -563,14 +524,6 @@ class VCDDecoder:
 
             next_token = sample_or_argmax(
                 selection_logits,
-                do_sample=cfg.do_sample,
-            )
-
-            next_token = maybe_fallback_to_clean(
-                selected_token=next_token,
-                clean_logits=clean_logits,
-                fallback_to_clean=cfg.fallback_to_clean,
-                fallback_clean_prob_ratio=cfg.fallback_clean_prob_ratio,
                 do_sample=cfg.do_sample,
             )
 
@@ -598,6 +551,7 @@ class VCDDecoder:
             )
 
             next_input_ids = next_token
+            next_input_ids_cd = next_token
 
             if len(eos_token_ids) > 0:
                 newly_finished = torch.zeros_like(finished)
@@ -679,8 +633,15 @@ class VCDDecoder:
         rows: List[Dict[str, Any]] = []
 
         for sample, caption in zip(samples, output.captions):
+            sample_id = sample[id_key]
+
+            try:
+                sample_id = int(sample_id)
+            except Exception:
+                pass
+
             row: Dict[str, Any] = {
-                id_key: int(sample[id_key]),
+                id_key: sample_id,
                 caption_key: caption,
             }
 

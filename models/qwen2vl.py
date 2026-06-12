@@ -1,21 +1,4 @@
-"""
-Qwen2-VL wrapper.
-
-Default target:
-    Qwen/Qwen2-VL-7B-Instruct
-
-Requires:
-    pip install qwen-vl-utils
-
-Use:
-    use_chat_template=True
-
-Important for VCD:
-    Qwen2-VL VCD should create the contrastive branch by noising the raw image,
-    then re-running the Qwen processor.
-
-    Do NOT directly add noise to Qwen's processed pixel_values.
-"""
+# models/qwen2vl.py
 
 from __future__ import annotations
 
@@ -109,17 +92,18 @@ class Qwen2VLWrapper:
         if images is not None:
             loaded = []
 
-            for img in images:
-                if isinstance(img, Image.Image):
-                    loaded.append(img.convert("RGB"))
+            for image in images:
+                if isinstance(image, Image.Image):
+                    loaded.append(image.convert("RGB"))
                 else:
-                    loaded.append(img)
+                    loaded.append(image)
 
             return loaded
 
         if image_paths is None:
             raise ValueError("Either image_paths or images must be provided.")
 
+        # Official Qwen path accepts image paths in messages.
         return [str(path) for path in image_paths]
 
     def _load_pil_images_for_vcd(
@@ -128,20 +112,20 @@ class Qwen2VLWrapper:
         images: Optional[Sequence[Any]] = None,
     ) -> List[Image.Image]:
         if images is not None:
-            out = []
+            loaded = []
 
-            for img in images:
-                if isinstance(img, Image.Image):
-                    out.append(img.convert("RGB"))
+            for image in images:
+                if isinstance(image, Image.Image):
+                    loaded.append(image.convert("RGB"))
                 else:
                     raise TypeError(
-                        "For VCD with in-memory images, expected PIL.Image.Image."
+                        "Qwen2VL VCD with in-memory images expects PIL.Image.Image."
                     )
 
-            return out
+            return loaded
 
         if image_paths is None:
-            raise ValueError("Missing image_paths/images metadata for VCD.")
+            raise ValueError("Missing image_paths/images for Qwen2VL VCD.")
 
         return [load_image(path, mode="RGB") for path in image_paths]
 
@@ -170,14 +154,10 @@ class Qwen2VLWrapper:
         self,
         inputs: TensorDict,
     ) -> TensorDict:
-        """
-        Drop private metadata before model.forward/generate.
-        """
-
         return {
             key: value
             for key, value in inputs.items()
-            if not key.startswith("_")
+            if not str(key).startswith("_")
         }
 
     def prepare_batch(
@@ -212,11 +192,8 @@ class Qwen2VLWrapper:
                 f"prompts length {len(prompts)} != images length {len(image_objs)}"
             )
 
-        # Qwen2-VL requires the chat template for correct visual tokens.
-        use_chat_template = True
-
         messages_batch = [
-            self._build_messages(image_obj, prompt)
+            self._build_messages(image_obj=image_obj, prompt=prompt)
             for image_obj, prompt in zip(image_objs, prompts)
         ]
 
@@ -253,19 +230,17 @@ class Qwen2VLWrapper:
 
         inputs = dict(self.processor(**processor_kwargs))
 
-        # Private metadata for VCD.
-        inputs["_vcd_model_type"] = "qwen2vl"
-        inputs["_vcd_prompts"] = prompts
-        inputs["_vcd_use_chat_template"] = True
+        # Private metadata for Qwen VCD only.
+        inputs["_qwen_prompts"] = prompts
 
         if image_paths is not None:
-            inputs["_vcd_image_paths"] = [str(p) for p in image_paths]
-            inputs["_vcd_images"] = None
+            inputs["_qwen_image_paths"] = [str(path) for path in image_paths]
+            inputs["_qwen_images"] = None
         else:
-            inputs["_vcd_image_paths"] = None
-            inputs["_vcd_images"] = [
-                img.convert("RGB") if isinstance(img, Image.Image) else img
-                for img in images
+            inputs["_qwen_image_paths"] = None
+            inputs["_qwen_images"] = [
+                image.convert("RGB") if isinstance(image, Image.Image) else image
+                for image in images
             ]
 
         return inputs
@@ -275,24 +250,14 @@ class Qwen2VLWrapper:
         inputs: TensorDict,
         noise_step: int = 500,
     ) -> TensorDict:
-        """
-        Build the contrastive/noised branch for Qwen2-VL.
-
-        This is the key fix:
-            raw image -> noise -> Qwen processor
-
-        NOT:
-            processed pixel_values -> noise
-        """
-
-        prompts = inputs.get("_vcd_prompts", None)
-        image_paths = inputs.get("_vcd_image_paths", None)
-        images = inputs.get("_vcd_images", None)
+        prompts = inputs.get("_qwen_prompts", None)
+        image_paths = inputs.get("_qwen_image_paths", None)
+        images = inputs.get("_qwen_images", None)
 
         if prompts is None:
             raise ValueError(
-                "Missing `_vcd_prompts`. "
-                "Call wrapper.prepare_batch() before VCD."
+                "Missing `_qwen_prompts`. "
+                "Qwen VCD requires inputs from Qwen2VLWrapper.prepare_batch()."
             )
 
         pil_images = self._load_pil_images_for_vcd(
@@ -318,7 +283,7 @@ class Qwen2VLWrapper:
         self,
         token_ids: torch.Tensor,
         skip_special_tokens: bool = True,
-        clean_up_tokenization_spaces: bool = True,
+        clean_up_tokenization_spaces: bool = False,
     ) -> List[str]:
         return [
             text.strip()
@@ -357,23 +322,24 @@ class Qwen2VLWrapper:
             else:
                 moved[key] = value
 
-        if "pad_token_id" not in generate_kwargs:
-            generate_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
-
-        if "eos_token_id" not in generate_kwargs:
-            generate_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+        generate_kwargs.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        generate_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
 
         output_ids = self.model.generate(
             **moved,
             **generate_kwargs,
         )
 
-        prompt_len = moved["input_ids"].shape[1]
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(moved["input_ids"], output_ids)
+        ]
 
-        if output_ids.shape[1] > prompt_len:
-            new_token_ids = output_ids[:, prompt_len:]
-        else:
-            new_token_ids = output_ids
+        new_token_ids = torch.nn.utils.rnn.pad_sequence(
+            generated_ids_trimmed,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
 
         captions = self.batch_decode(new_token_ids)
 

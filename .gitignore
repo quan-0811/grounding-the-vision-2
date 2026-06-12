@@ -217,6 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 data/coco2017/
-
+data/amber/
 outputs/
 
