@@ -271,9 +271,6 @@ def extract_image_attn_by_layer(
     if len(attentions) == 0:
         return None, image_token_indices
 
-    if selected_layers is None:
-        selected_layers = [-1]
-
     if image_token_indices is None:
         image_token_indices = resolve_image_token_indices(
             input_ids=input_ids,
