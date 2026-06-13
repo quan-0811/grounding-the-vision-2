@@ -12,6 +12,7 @@ from utils.io import (
     save_json,
     save_json_atomic,
     save_jsonl,
+    load_json_or_jsonl
 )
 
 from utils.config import (
@@ -44,4 +45,9 @@ from utils.image_noise import (
     add_diffusion_noise_to_pil,
     add_diffusion_noise_to_tensor,
     get_diffusion_coefficients,
+)
+
+from utils.dict_utils import (
+    first_existing,
+    maybe_int,
 )

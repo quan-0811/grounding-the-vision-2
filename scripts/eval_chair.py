@@ -8,117 +8,15 @@ import pickle
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from utils.io import load_json_or_jsonl, save_json, save_jsonl
+from utils.dict_utils import first_existing, maybe_int
+from evaluation.formatters import format_coco_row
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-
-def load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
-    text = path.read_text(encoding="utf-8").strip()
-
-    if not text:
-        return []
-
-    if text.startswith("["):
-        data = json.loads(text)
-        if not isinstance(data, list):
-            raise ValueError(f"Expected JSON list in {path}")
-        return data
-
-    rows: List[Dict[str, Any]] = []
-
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        line = line.strip()
-
-        if not line:
-            continue
-
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Invalid JSON on line {line_no} in {path}: {e}"
-            ) from e
-
-        if not isinstance(row, dict):
-            raise ValueError(
-                f"Expected JSON object on line {line_no} in {path}"
-            )
-
-        rows.append(row)
-
-    return rows
-
-
-def maybe_int(value: Any) -> Any:
-    if isinstance(value, int):
-        return value
-
-    if isinstance(value, str):
-        value = value.strip()
-
-        if value.isdigit():
-            return int(value)
-
-    return value
-
-
-def first_existing(row: Dict[str, Any], keys: List[str]) -> Optional[Any]:
-    for key in keys:
-        value = row.get(key)
-
-        if value is not None:
-            return value
-
-    return None
-
-
-def format_coco_rows(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    formatted: List[Dict[str, Any]] = []
-
-    for idx, row in enumerate(raw_rows):
-        image_id = first_existing(row, ["image_id", "id"])
-        caption = first_existing(row, ["caption", "response", "prediction", "text"])
-
-        if image_id is None:
-            raise ValueError(
-                f"Row {idx} has no image_id/id. "
-                f"Available keys: {list(row.keys())}"
-            )
-
-        if caption is None or str(caption).strip() == "":
-            raise ValueError(
-                f"Row {idx} has no caption/response. "
-                f"Available keys: {list(row.keys())}"
-            )
-
-        formatted.append(
-            {
-                "image_id": maybe_int(image_id),
-                "caption": str(caption).strip(),
-            }
-        )
-
-    return formatted
-
-
-def save_jsonl(rows: List[Dict[str, Any]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def save_json(data: Dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
 
 def default_formatted_path(input_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{input_path.stem}_chair_format.jsonl"
@@ -287,7 +185,8 @@ def main() -> None:
         cap_file = input_path
     else:
         raw_rows = load_json_or_jsonl(input_path)
-        formatted_rows = format_coco_rows(raw_rows)
+        formatted_rows = [format_coco_row(row) for row in raw_rows]
+        formatted_rows = [row for row in formatted_rows if row is not None]
         save_jsonl(formatted_rows, formatted_path)
         cap_file = formatted_path
 

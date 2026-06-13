@@ -9,116 +9,15 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from utils.io import load_json_or_jsonl, save_json
+from utils.dict_utils import first_existing, maybe_int
+from evaluation.formatters import format_amber_row
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-
-def load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
-    text = path.read_text(encoding="utf-8").strip()
-
-    if not text:
-        return []
-
-    if text.startswith("["):
-        data = json.loads(text)
-        if not isinstance(data, list):
-            raise ValueError(f"Expected JSON list in {path}")
-        return data
-
-    rows: List[Dict[str, Any]] = []
-
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        line = line.strip()
-
-        if not line:
-            continue
-
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Invalid JSON on line {line_no} in {path}: {e}"
-            ) from e
-
-        if not isinstance(row, dict):
-            raise ValueError(
-                f"Expected JSON object on line {line_no} in {path}"
-            )
-
-        rows.append(row)
-
-    return rows
-
-
-def maybe_int(value: Any) -> Any:
-    if isinstance(value, int):
-        return value
-
-    if isinstance(value, str):
-        value = value.strip()
-
-        if value.isdigit():
-            return int(value)
-
-    return value
-
-
-def first_existing(row: Dict[str, Any], keys: List[str]) -> Optional[Any]:
-    for key in keys:
-        value = row.get(key)
-
-        if value is not None:
-            return value
-
-    return None
-
-
-def format_amber_rows(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    formatted: List[Dict[str, Any]] = []
-
-    for idx, row in enumerate(raw_rows):
-        sample_id = first_existing(
-            row,
-            ["id", "amber_id", "question_id", "image_id", "idx"],
-        )
-
-        response = first_existing(
-            row,
-            ["response", "caption", "prediction", "text"],
-        )
-
-        if sample_id is None:
-            raise ValueError(
-                f"Row {idx} has no AMBER id. "
-                f"Available keys: {list(row.keys())}"
-            )
-
-        if response is None or str(response).strip() == "":
-            raise ValueError(
-                f"Row {idx} has no response/caption. "
-                f"Available keys: {list(row.keys())}"
-            )
-
-        formatted.append(
-            {
-                "id": maybe_int(sample_id),
-                "response": str(response).strip(),
-            }
-        )
-
-    return formatted
-
-
-def save_json_array(rows: List[Dict[str, Any]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-
 
 def default_formatted_path(input_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{input_path.stem}_amber_format.json"
@@ -224,8 +123,9 @@ def main() -> None:
         inference_data_path = input_path
     else:
         raw_rows = load_json_or_jsonl(input_path)
-        formatted_rows = format_amber_rows(raw_rows)
-        save_json_array(formatted_rows, formatted_path)
+        formatted_rows = [format_amber_row(row) for row in raw_rows]
+        formatted_rows = [row for row in formatted_rows if row is not None]
+        save_json(formatted_rows, formatted_path)
         inference_data_path = formatted_path
 
         print("Formatted AMBER input:", formatted_path)

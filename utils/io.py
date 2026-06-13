@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable, List, Union
+from typing import Any, Iterable, List, Union, Dict
 
 
 PathLike = Union[str, Path]
@@ -181,3 +181,39 @@ def count_json_rows(path: PathLike) -> int:
         return len(data)
 
     return 1
+
+def load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
+    text = path.read_text(encoding="utf-8").strip()
+
+    if not text:
+        return []
+
+    if text.startswith("["):
+        data = json.loads(text)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected JSON list in {path}")
+        return data
+
+    rows: List[Dict[str, Any]] = []
+
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid JSON on line {line_no} in {path}: {e}"
+            ) from e
+
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"Expected JSON object on line {line_no} in {path}"
+            )
+
+        rows.append(row)
+
+    return rows
