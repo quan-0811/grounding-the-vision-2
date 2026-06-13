@@ -5,7 +5,6 @@ Used by scripts so you can load models by short name:
 
     llava15_7b
     qwen2vl_7b
-    internvl2_8b
 """
 
 from __future__ import annotations
@@ -31,12 +30,6 @@ def build_model_config(
 
         config_kwargs.setdefault("model_id", "Qwen/Qwen2-VL-7B-Instruct")
         return Qwen2VLConfig(**config_kwargs)
-
-    if name in {"internvl2", "internvl2_8b"}:
-        from models.internvl2 import InternVL2Config
-
-        config_kwargs.setdefault("model_id", "OpenGVLab/InternVL2-8B")
-        return InternVL2Config(**config_kwargs)
 
     raise ValueError(f"Unknown model name: {model_name}")
 
@@ -65,13 +58,7 @@ def build_model_wrapper(
 
         return Qwen2VLWrapper(config)
 
-    if name in {"internvl2", "internvl2_8b"}:
-        from models.internvl2 import InternVL2Wrapper
-
-        return InternVL2Wrapper(config)
-
     raise ValueError(f"Unknown model name: {model_name}")
-
 
 def load_model(
     model_name: str,

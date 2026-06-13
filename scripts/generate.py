@@ -1,22 +1,19 @@
 # scripts/generate.py
 
-# scripts/generate.py
-
 from __future__ import annotations
 
+import argparse
+import hashlib
 import sys
+import traceback
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import argparse
-import traceback
-from typing import Any, Dict, Iterable, List, Sequence
-
-import torch
 from tqdm import tqdm
 
 from models.registry import build_model_wrapper
@@ -30,7 +27,6 @@ from utils.seed import seed_everything
 SUPPORTED_MODELS = {
     "llava15_7b",
     "qwen2vl_7b",
-    "internvl2_8b",
 }
 
 SUPPORTED_DECODINGS = {
@@ -62,7 +58,7 @@ def normalize_id(value: Any) -> str:
 
 
 def get_sample_id(sample: Dict[str, Any]) -> Any:
-    for key in ["id", "image_id", "question_id", "idx"]:
+    for key in ["id", "image_id", "question_id", "idx", "amber_id"]:
         if key in sample:
             return sample[key]
 
@@ -106,6 +102,28 @@ def model_uses_chat_template(model_name: str) -> bool:
 
 def parse_selected_layers(value: str) -> List[int]:
     return [int(x.strip()) for x in value.split(",") if x.strip()]
+
+
+def stable_seed_from_batch(
+    base_seed: int,
+    batch: Sequence[Dict[str, Any]],
+) -> int:
+    """
+    Build a deterministic per-batch seed.
+
+    This matters for VCD / VCD+PHG because the noised image branch uses
+    random diffusion noise. Using a stable seed makes resume/re-run behavior
+    much more reproducible.
+    """
+
+    if len(batch) == 0:
+        return int(base_seed)
+
+    ids = "|".join(normalize_id(get_sample_id(sample)) for sample in batch)
+    digest = hashlib.md5(ids.encode("utf-8")).hexdigest()
+    offset = int(digest[:8], 16)
+
+    return int((int(base_seed) + offset) % (2**31 - 1))
 
 
 # ============================================================
@@ -164,19 +182,17 @@ def build_model_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "device_map": args.device_map,
     }
 
-    if args.model == "llava15_7b":
+    if args.attn_implementation is not None and args.attn_implementation != "none":
         kwargs["attn_implementation"] = args.attn_implementation
 
-    elif args.model == "qwen2vl_7b":
-        kwargs["attn_implementation"] = args.attn_implementation
-
+    if args.model == "qwen2vl_7b":
         if args.qwen_min_pixels is not None:
             kwargs["min_pixels"] = args.qwen_min_pixels
 
         if args.qwen_max_pixels is not None:
             kwargs["max_pixels"] = args.qwen_max_pixels
 
-    elif args.model == "internvl2_8b":
+    elif args.model == "llava15_7b":
         pass
 
     else:
@@ -191,15 +207,22 @@ def build_normal_decoder_config(
     args: argparse.Namespace,
 ):
     if decoding == "greedy":
-        # Match GreedyConfig exactly.
         config_kwargs = {
             "max_new_tokens": args.max_new_tokens,
             "do_sample": args.do_sample,
             "use_cache": True,
         }
 
+        if args.do_sample:
+            config_kwargs.update(
+                {
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "top_k": args.top_k,
+                }
+            )
+
     elif decoding == "dola_low":
-        # Keep DoLA config minimal too.
         config_kwargs = {
             "max_new_tokens": args.max_new_tokens,
             "dola_layers": "low",
@@ -208,12 +231,22 @@ def build_normal_decoder_config(
             "use_cache": True,
         }
 
+        if args.do_sample:
+            config_kwargs.update(
+                {
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "top_k": args.top_k,
+                }
+            )
+
     elif decoding == "vcd":
         if model_name not in {"llava15_7b", "qwen2vl_7b"}:
             raise ValueError(
-                f"VCD is enabled only for llava15_7b and qwen2vl_7b. Got {model_name}."
+                f"VCD is enabled only for llava15_7b and qwen2vl_7b. "
+                f"Got {model_name}."
             )
-    
+
         config_kwargs = {
             "max_new_tokens": args.max_new_tokens,
             "cd_alpha": args.cd_alpha,
@@ -222,7 +255,7 @@ def build_normal_decoder_config(
             "do_sample": args.do_sample,
             "use_cache": True,
         }
-    
+
         if args.do_sample:
             config_kwargs.update(
                 {
@@ -248,48 +281,51 @@ def build_phg_config(
 ) -> PHGConfig:
     mode = get_base_phg_mode(decoding)
 
-    if mode == "vcd" and model_name != "llava15_7b":
-        raise ValueError(
-            f"VCD-PHG is currently enabled only for llava15_7b. Got {model_name}."
-        )
+    if mode == "dola":
+        dola_layers = "low"
+    else:
+        dola_layers = None
 
+    # LLaVA-1.5 has fixed 24x24 image token grid.
+    # Qwen2-VL uses dynamic image_grid_thw, so keep None.
     image_grid_shape = (24, 24) if model_name == "llava15_7b" else None
 
-    kwargs: Dict[str, Any] = {
-        "decoding_mode": mode,
-        "max_rounds": args.phg_max_rounds,
-        "max_new_tokens": args.max_new_tokens,
-        "min_new_tokens": args.phg_min_new_tokens,
-        "top_k": args.phg_top_k,
-        "accumulate_prob": args.phg_accumulate_prob,
-        "iou_thresh": args.phg_iou_thresh,
-        "ads_thresh": args.phg_ads_thresh,
-        "ads_foreground_ratio": args.phg_ads_foreground_ratio,
-        "selected_layers": args.selected_layers,
-        "image_grid_shape": image_grid_shape,
-        "debug": args.phg_debug,
-    }
+    return PHGConfig(
+        decoding_mode=mode,
 
-    if mode == "dola":
-        kwargs.update(
-            {
-                "dola_layers": "low",
-                "dola_relative_top": args.dola_relative_top,
-                "repetition_penalty": args.repetition_penalty,
-            }
-        )
+        max_rounds=args.phg_max_rounds,
+        max_new_tokens=args.max_new_tokens,
+        min_new_tokens=args.phg_min_new_tokens,
 
-    elif mode == "vcd":
-        kwargs.update(
-            {
-                "cd_alpha": args.cd_alpha,
-                "cd_beta": args.cd_beta,
-                "noise_step": args.noise_step,
-                "top_p": args.top_p,
-            }
-        )
+        top_k=args.phg_top_k,
+        accumulate_prob=args.phg_accumulate_prob,
 
-    return PHGConfig(**kwargs)
+        iou_thresh=args.phg_iou_thresh,
+        ads_thresh=args.phg_ads_thresh,
+        ads_foreground_ratio=args.phg_ads_foreground_ratio,
+
+        selected_layers=args.selected_layers,
+        image_grid_shape=image_grid_shape,
+
+        do_sample=args.do_sample,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+
+        stop_at_sentence_end=args.stop_at_sentence_end,
+        stop_if_sentence_end_in_candidates=args.stop_if_sentence_end_in_candidates,
+
+        dola_layers=dola_layers,
+        dola_relative_top=args.dola_relative_top,
+        dola_select_strategy=args.dola_select_strategy,
+
+        cd_alpha=args.cd_alpha,
+        cd_beta=args.cd_beta,
+        noise_step=args.noise_step,
+        image_tensor_key="pixel_values",
+
+        debug=args.phg_debug,
+    )
 
 
 # ============================================================
@@ -310,8 +346,14 @@ def add_row_metadata(
     if "image_id" in sample:
         out.setdefault("image_id", sample["image_id"])
 
+    if "amber_id" in sample:
+        out.setdefault("amber_id", sample["amber_id"])
+
     if "image_path" in sample:
         out.setdefault("image_path", sample["image_path"])
+
+    if "file_name" in sample:
+        out.setdefault("file_name", sample["file_name"])
 
     if "prompt" in sample:
         out.setdefault("prompt", sample["prompt"])
@@ -320,6 +362,7 @@ def add_row_metadata(
     out["decoding"] = args.decoding
     out["dataset"] = args.dataset
 
+    # AMBER evaluator alias.
     if args.dataset == "amber" and "caption" in out:
         out["response"] = out["caption"]
 
@@ -349,6 +392,7 @@ def generate_batch_rows(
             id_key="id",
             caption_key="caption",
             use_chat_template=use_chat_template,
+            include_prompt=True,
             include_trace=args.include_trace,
         )
 
@@ -388,23 +432,21 @@ def generate_batch_rows(
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.model not in SUPPORTED_MODELS:
-        raise ValueError(f"Unknown model: {args.model}")
+        raise ValueError(
+            f"Unknown model: {args.model}. "
+            f"Supported models: {sorted(SUPPORTED_MODELS)}"
+        )
 
     if args.decoding not in SUPPORTED_DECODINGS:
-        raise ValueError(f"Unknown decoding: {args.decoding}")
+        raise ValueError(
+            f"Unknown decoding: {args.decoding}. "
+            f"Supported decodings: {sorted(SUPPORTED_DECODINGS)}"
+        )
 
     if args.dataset not in SUPPORTED_DATASETS:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
-
-    if args.model == "qwen2vl_7b" and args.decoding == "vcd_phg":
         raise ValueError(
-            "Qwen2-VL + VCD-PHG is still disabled. "
-            "Only normal Qwen2-VL VCD is re-enabled through LogitsProcessor."
-        )
-        
-    if args.model == "internvl2_8b" and args.decoding != "greedy":
-        raise ValueError(
-            "InternVL2 currently supports greedy only."
+            f"Unknown dataset: {args.dataset}. "
+            f"Supported datasets: {sorted(SUPPORTED_DATASETS)}"
         )
 
     if is_phg_decoding(args.decoding) and args.batch_size != 1:
@@ -413,6 +455,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.output is None:
         raise ValueError("--output is required")
+
+    if args.do_sample and args.temperature <= 0:
+        raise ValueError("--temperature must be > 0 when --do-sample is used.")
 
 
 # ============================================================
@@ -437,18 +482,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--prompt", default="Describe this image.")
     parser.add_argument("--max-new-tokens", type=int, default=64)
+
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--repetition-penalty", type=float, default=1.2)
 
+    # VCD
     parser.add_argument("--cd-alpha", type=float, default=1.0)
     parser.add_argument("--cd-beta", type=float, default=0.1)
     parser.add_argument("--noise-step", type=int, default=500)
 
+    # DoLA
     parser.add_argument("--dola-relative-top", type=float, default=0.1)
+    parser.add_argument("--dola-select-strategy", default="argmax")
 
+    # PHG
     parser.add_argument("--phg-max-rounds", type=int, default=4)
     parser.add_argument("--phg-min-new-tokens", type=int, default=3)
     parser.add_argument("--phg-top-k", type=int, default=3)
@@ -458,13 +508,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phg-ads-foreground-ratio", type=float, default=0.10)
     parser.add_argument("--phg-debug", action="store_true")
     parser.add_argument("--include-trace", action="store_true")
-        
+
+    parser.add_argument(
+        "--stop-at-sentence-end",
+        action="store_true",
+        help="Stop each PHG round at a sentence boundary.",
+    )
+
+    parser.add_argument(
+        "--stop-if-sentence-end-in-candidates",
+        action="store_true",
+        help="Stop early if a sentence boundary appears among uncertain candidates.",
+    )
+
     parser.add_argument(
         "--selected-layers",
         type=parse_selected_layers,
         default=[-8, -4, -1],
     )
 
+    # COCO
     parser.add_argument(
         "--coco-image-dir",
         default="data/coco2017/val2017",
@@ -473,6 +536,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--coco-annotation-path",
         default="data/coco2017/annotations/instances_val2017.json",
     )
+
+    # AMBER
     parser.add_argument(
         "--amber-root",
         default="data/amber",
@@ -490,17 +555,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="data/amber/annotations.json",
     )
 
+    # Qwen dynamic-resolution controls
     parser.add_argument("--qwen-min-pixels", type=int, default=None)
     parser.add_argument("--qwen-max-pixels", type=int, default=None)
 
     return parser
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
     validate_args(args)
+
     seed_everything(args.seed)
 
     output_path = Path(args.output)
@@ -516,6 +587,8 @@ def main() -> None:
     print("batch_size:", args.batch_size)
     print("max_samples:", args.max_samples)
     print("max_new_tokens:", args.max_new_tokens)
+    print("phg_max_rounds:", args.phg_max_rounds)
+    print("seed:", args.seed)
     print("output:", args.output)
     print("resume:", args.resume)
 
@@ -557,6 +630,13 @@ def main() -> None:
 
     for batch_idx, batch in enumerate(tqdm(batches, desc="Generating")):
         try:
+            # Stable per-batch seed. Important for VCD / VCD+PHG noised branch.
+            batch_seed = stable_seed_from_batch(
+                base_seed=args.seed,
+                batch=batch,
+            )
+            seed_everything(batch_seed)
+
             rows = generate_batch_rows(
                 wrapper=wrapper,
                 batch=batch,

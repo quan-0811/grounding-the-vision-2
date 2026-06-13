@@ -1,23 +1,30 @@
-"""
-Decoder registry.
-
-Use this from scripts/generate.py so the script does not need many if/else
-blocks for greedy, DoLA, VCD, and PHG variants.
-"""
+# decoding/registry.py
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
+
+from models.base import BaseLVLM
+
+
+SUPPORTED_DECODERS = {
+    "greedy",
+    "dola_low",
+    "vcd",
+}
+
+
+def _is_qwen2vl_wrapper(wrapper: BaseLVLM) -> bool:
+    model_id = getattr(getattr(wrapper, "config", None), "model_id", "")
+    model_id = str(model_id).lower()
+
+    return "qwen2-vl" in model_id or "qwen2.5-vl" in model_id
 
 
 def build_decoder_config(
     decoding_name: str,
     config_kwargs: Optional[Dict[str, Any]] = None,
-) -> Any:
-    """
-    Build config object by decoding name.
-    """
-
+):
     config_kwargs = config_kwargs or {}
     name = decoding_name.lower()
 
@@ -26,12 +33,10 @@ def build_decoder_config(
 
         return GreedyConfig(**config_kwargs)
 
-    if name in {"dola", "dola_low"}:
+    if name in {"dola_low", "dola"}:
         from decoding.dola import DoLAConfig
 
-        if "dola_layers" not in config_kwargs:
-            config_kwargs["dola_layers"] = "low"
-
+        config_kwargs.setdefault("dola_layers", "low")
         return DoLAConfig(**config_kwargs)
 
     if name == "vcd":
@@ -39,48 +44,20 @@ def build_decoder_config(
 
         return VCDConfig(**config_kwargs)
 
-    if name in {"greedy_phg", "dola_phg", "dola_low_phg", "vcd_phg"}:
-        from phg import PHGConfig
+    raise ValueError(
+        f"Unknown decoding name: {decoding_name}. "
+        f"Supported decoders: {sorted(SUPPORTED_DECODERS)}"
+    )
 
-        if name == "greedy_phg":
-            config_kwargs.setdefault("decoding_mode", "greedy")
-
-        elif name in {"dola_phg", "dola_low_phg"}:
-            config_kwargs.setdefault("decoding_mode", "dola")
-            config_kwargs.setdefault("dola_layers", "low")
-
-        elif name == "vcd_phg":
-            config_kwargs.setdefault("decoding_mode", "vcd")
-
-        return PHGConfig(**config_kwargs)
-
-    raise ValueError(f"Unknown decoding name: {decoding_name}")
-
-def _is_qwen2vl_wrapper(wrapper) -> bool:
-    model_id = getattr(getattr(wrapper, "config", None), "model_id", "")
-    model_id = str(model_id).lower()
-
-    return "qwen2-vl" in model_id
 
 def generate_samples_with_decoder(
     decoding_name: str,
-    wrapper,
-    samples,
-    config: Optional[Any] = None,
-    config_kwargs: Optional[Dict[str, Any]] = None,
-    **kwargs,
+    wrapper: BaseLVLM,
+    samples: Sequence[Dict[str, Any]],
+    config: Any = None,
+    **kwargs: Any,
 ):
-    """
-    Dispatch generation by decoding name.
-    """
-
     name = decoding_name.lower()
-
-    if config is None:
-        config = build_decoder_config(
-            decoding_name=name,
-            config_kwargs=config_kwargs,
-        )
 
     if name == "greedy":
         from decoding.greedy import generate_greedy_samples
@@ -92,7 +69,7 @@ def generate_samples_with_decoder(
             **kwargs,
         )
 
-    if name in {"dola", "dola_low"}:
+    if name in {"dola_low", "dola"}:
         from decoding.dola import generate_dola_samples
 
         return generate_dola_samples(
@@ -105,16 +82,16 @@ def generate_samples_with_decoder(
     if name == "vcd":
         if _is_qwen2vl_wrapper(wrapper):
             from decoding.qwen_vcd import generate_qwen_vcd_samples
-    
+
             return generate_qwen_vcd_samples(
                 wrapper=wrapper,
                 samples=samples,
                 config=config,
                 **kwargs,
             )
-    
+
         from decoding.vcd import generate_vcd_samples
-    
+
         return generate_vcd_samples(
             wrapper=wrapper,
             samples=samples,
@@ -122,14 +99,7 @@ def generate_samples_with_decoder(
             **kwargs,
         )
 
-    if name in {"greedy_phg", "dola_phg", "dola_low_phg", "vcd_phg"}:
-        from phg import generate_phg_samples
-
-        return generate_phg_samples(
-            wrapper=wrapper,
-            samples=samples,
-            config=config,
-            **kwargs,
-        )
-
-    raise ValueError(f"Unknown decoding name: {decoding_name}")
+    raise ValueError(
+        f"Unknown decoding name: {decoding_name}. "
+        f"Supported decoders: {sorted(SUPPORTED_DECODERS)}"
+    )

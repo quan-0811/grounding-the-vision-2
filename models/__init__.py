@@ -19,11 +19,6 @@ from models.qwen2vl import (
     Qwen2VLWrapper,
 )
 
-from models.internvl2 import (
-    InternVL2Config,
-    InternVL2Wrapper,
-)
-
 from models.registry import (
     build_model_config,
     build_model_wrapper,

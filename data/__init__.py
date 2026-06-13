@@ -5,12 +5,11 @@ from data.coco import (
     load_coco_val2017,
     save_coco_sample_ids,
 )
-
 from data.amber import (
     find_amber_images,
     load_amber,
 )
-
 from data.registry import (
+    SUPPORTED_DATASETS,
     load_dataset,
 )
