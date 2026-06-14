@@ -1,0 +1,22 @@
+generation:
+  max_new_tokens: 64
+  do_sample: false
+  temperature: 1.0
+  top_p: null
+  top_k: null
+  repetition_penalty: 1.2
+
+decoding_kwargs: {}
+
+phg_kwargs:
+  phg_max_rounds: 4
+  phg_min_new_tokens: 3
+  phg_top_k: 3
+  phg_accumulate_prob: 0.4
+  phg_iou_thresh: 0.5
+  phg_ads_thresh: 0.45
+  phg_ads_foreground_ratio: 0.10
+  selected_layers: null
+  stop_at_sentence_end: true
+  stop_if_sentence_end_in_candidates: false
+  phg_debug: false

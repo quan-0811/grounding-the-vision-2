@@ -1,0 +1,13 @@
+model_kwargs:
+  dtype: "float16"
+  device_map: "auto"
+  attn_implementation: "eager"
+
+  qwen_min_pixels: null
+  qwen_max_pixels: null
+
+runtime:
+  batch_size: 1
+  seed: 42
+  resume: false
+  include_trace: false

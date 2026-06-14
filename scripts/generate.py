@@ -7,7 +7,7 @@ import hashlib
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +20,7 @@ from models.registry import build_model_wrapper
 from decoding.registry import build_decoder_config, generate_samples_with_decoder
 from phg import PHGConfig, generate_phg_samples
 
+from utils.config import deep_update, get_config_section, load_yaml
 from utils.io import load_json, save_json_atomic, ensure_dir
 from utils.seed import seed_everything
 
@@ -42,6 +43,162 @@ SUPPORTED_DATASETS = {
     "coco_val2017",
     "amber",
 }
+
+
+CONFIG_SECTIONS = [
+    "runtime",
+    "model_kwargs",
+    "dataset_kwargs",
+    "generation",
+    "decoding_kwargs",
+    "phg_kwargs",
+]
+
+
+HARD_DEFAULTS: Dict[str, Any] = {
+    "dtype": "float16",
+    "device_map": "auto",
+    "attn_implementation": "eager",
+    "batch_size": 1,
+    "max_samples": None,
+    "resume": False,
+    "seed": 42,
+
+    "prompt": "Describe this image.",
+    "max_new_tokens": 64,
+
+    "do_sample": False,
+    "temperature": 1.0,
+    "top_p": None,
+    "top_k": None,
+    "repetition_penalty": 1.2,
+
+    "cd_alpha": 1.0,
+    "cd_beta": 0.1,
+    "noise_step": 500,
+
+    "dola_relative_top": 0.1,
+    "dola_select_strategy": "argmax",
+
+    "phg_max_rounds": 5,
+    "phg_min_new_tokens": 3,
+    "phg_top_k": 3,
+    "phg_accumulate_prob": 0.5,
+    "phg_iou_thresh": 0.5,
+    "phg_ads_thresh": 0.45,
+    "phg_ads_foreground_ratio": 0.10,
+    "phg_debug": False,
+    "include_trace": False,
+    "stop_at_sentence_end": False,
+    "stop_if_sentence_end_in_candidates": False,
+    "selected_layers": None,
+
+    "coco_image_dir": "data/coco2017/val2017",
+    "coco_annotation_path": "data/coco2017/annotations/instances_val2017.json",
+
+    "amber_root": "data/amber",
+    "amber_image_dir": None,
+    "amber_query_path": "data/amber/query/query_generative.json",
+    "amber_annotation_path": "data/amber/annotations.json",
+
+    "qwen_min_pixels": None,
+    "qwen_max_pixels": None,
+}
+
+
+# ============================================================
+# Config loading
+# ============================================================
+
+def config_path(
+    config_root: Path,
+    section: str,
+    name: str,
+) -> Path:
+    return config_root / section / f"{name}.yaml"
+
+
+def load_generation_config(args: argparse.Namespace) -> Dict[str, Any]:
+    config_root = Path(args.config_root)
+
+    model_path = (
+        Path(args.model_config)
+        if args.model_config is not None
+        else config_path(config_root, "models", args.model)
+    )
+
+    dataset_path = (
+        Path(args.dataset_config)
+        if args.dataset_config is not None
+        else config_path(config_root, "datasets", args.dataset)
+    )
+
+    decoding_path = (
+        Path(args.decoding_config)
+        if args.decoding_config is not None
+        else config_path(config_root, "decoding", args.decoding)
+    )
+
+    merged: Dict[str, Any] = {}
+
+    for path in [model_path, dataset_path, decoding_path]:
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+        merged = deep_update(merged, load_yaml(path))
+
+    return merged
+
+
+def fill_args_from_config(
+    args: argparse.Namespace,
+    cfg: Dict[str, Any],
+) -> argparse.Namespace:
+    for section_name in CONFIG_SECTIONS:
+        section = get_config_section(cfg, section_name)
+
+        for key, value in section.items():
+            if not hasattr(args, key):
+                raise ValueError(
+                    f"Unknown config key `{key}` in section `{section_name}`. "
+                    f"Add it to argparse or remove it from YAML."
+                )
+
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+
+    for key, value in HARD_DEFAULTS.items():
+        if hasattr(args, key) and getattr(args, key) is None:
+            setattr(args, key, value)
+
+    return args
+
+
+def print_effective_config(
+    args: argparse.Namespace,
+    cfg: Dict[str, Any],
+) -> None:
+    if not args.print_config:
+        return
+
+    print("=" * 100)
+    print("LOADED YAML CONFIG")
+    print("=" * 100)
+
+    for section_name in CONFIG_SECTIONS:
+        section = get_config_section(cfg, section_name)
+        if section:
+            print(f"[{section_name}]")
+            for key, value in section.items():
+                print(f"{key}: {value}")
+            print()
+
+    print("=" * 100)
+    print("EFFECTIVE ARGS")
+    print("=" * 100)
+
+    for key, value in sorted(vars(args).items()):
+        print(f"{key}: {value}")
 
 
 # ============================================================
@@ -100,7 +257,12 @@ def model_uses_chat_template(model_name: str) -> bool:
     return model_name == "qwen2vl_7b"
 
 
-def parse_selected_layers(value: str) -> List[int]:
+def parse_selected_layers(value: str) -> Optional[List[int]]:
+    value = str(value).strip().lower()
+
+    if value in {"none", "null", "auto", "all"}:
+        return None
+
     return [int(x.strip()) for x in value.split(",") if x.strip()]
 
 
@@ -108,14 +270,6 @@ def stable_seed_from_batch(
     base_seed: int,
     batch: Sequence[Dict[str, Any]],
 ) -> int:
-    """
-    Build a deterministic per-batch seed.
-
-    This matters for VCD / VCD+PHG because the noised image branch uses
-    random diffusion noise. Using a stable seed makes resume/re-run behavior
-    much more reproducible.
-    """
-
     if len(batch) == 0:
         return int(base_seed)
 
@@ -281,13 +435,8 @@ def build_phg_config(
 ) -> PHGConfig:
     mode = get_base_phg_mode(decoding)
 
-    if mode == "dola":
-        dola_layers = "low"
-    else:
-        dola_layers = None
+    dola_layers = "low" if mode == "dola" else None
 
-    # LLaVA-1.5 has fixed 24x24 image token grid.
-    # Qwen2-VL uses dynamic image_grid_thw, so keep None.
     image_grid_shape = (24, 24) if model_name == "llava15_7b" else None
 
     return PHGConfig(
@@ -362,7 +511,6 @@ def add_row_metadata(
     out["decoding"] = args.decoding
     out["dataset"] = args.dataset
 
-    # AMBER evaluator alias.
     if args.dataset == "amber" and "caption" in out:
         out["response"] = out["caption"]
 
@@ -472,90 +620,72 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", required=True, choices=sorted(SUPPORTED_DATASETS))
     parser.add_argument("--output", required=True)
 
-    parser.add_argument("--dtype", default="float16")
-    parser.add_argument("--device-map", default="auto")
-    parser.add_argument("--attn-implementation", default="eager")
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--config-root", default="configs")
+    parser.add_argument("--model-config", default=None)
+    parser.add_argument("--dataset-config", default=None)
+    parser.add_argument("--decoding-config", default=None)
+    parser.add_argument("--print-config", action="store_true")
+
+    parser.add_argument("--dtype", default=None)
+    parser.add_argument("--device-map", default=None)
+    parser.add_argument("--attn-implementation", default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--seed", type=int, default=None)
 
-    parser.add_argument("--prompt", default="Describe this image.")
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--prompt", default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
 
-    parser.add_argument("--do-sample", action="store_true")
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
-    parser.add_argument("--repetition-penalty", type=float, default=1.2)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
 
-    # VCD
-    parser.add_argument("--cd-alpha", type=float, default=1.0)
-    parser.add_argument("--cd-beta", type=float, default=0.1)
-    parser.add_argument("--noise-step", type=int, default=500)
+    parser.add_argument("--cd-alpha", type=float, default=None)
+    parser.add_argument("--cd-beta", type=float, default=None)
+    parser.add_argument("--noise-step", type=int, default=None)
 
-    # DoLA
-    parser.add_argument("--dola-relative-top", type=float, default=0.1)
-    parser.add_argument("--dola-select-strategy", default="argmax")
+    parser.add_argument("--dola-relative-top", type=float, default=None)
+    parser.add_argument("--dola-select-strategy", default=None)
 
-    # PHG
-    parser.add_argument("--phg-max-rounds", type=int, default=4)
-    parser.add_argument("--phg-min-new-tokens", type=int, default=3)
-    parser.add_argument("--phg-top-k", type=int, default=3)
-    parser.add_argument("--phg-accumulate-prob", type=float, default=0.5)
-    parser.add_argument("--phg-iou-thresh", type=float, default=0.5)
-    parser.add_argument("--phg-ads-thresh", type=float, default=0.45)
-    parser.add_argument("--phg-ads-foreground-ratio", type=float, default=0.10)
-    parser.add_argument("--phg-debug", action="store_true")
-    parser.add_argument("--include-trace", action="store_true")
+    parser.add_argument("--phg-max-rounds", type=int, default=None)
+    parser.add_argument("--phg-min-new-tokens", type=int, default=None)
+    parser.add_argument("--phg-top-k", type=int, default=None)
+    parser.add_argument("--phg-accumulate-prob", type=float, default=None)
+    parser.add_argument("--phg-iou-thresh", type=float, default=None)
+    parser.add_argument("--phg-ads-thresh", type=float, default=None)
+    parser.add_argument("--phg-ads-foreground-ratio", type=float, default=None)
+    parser.add_argument("--phg-debug", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--include-trace", action=argparse.BooleanOptionalAction, default=None)
 
     parser.add_argument(
         "--stop-at-sentence-end",
-        action="store_true",
-        help="Stop each PHG round at a sentence boundary.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
 
     parser.add_argument(
         "--stop-if-sentence-end-in-candidates",
-        action="store_true",
-        help="Stop early if a sentence boundary appears among uncertain candidates.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
 
     parser.add_argument(
         "--selected-layers",
         type=parse_selected_layers,
-        default=[-8, -4, -1],
-    )
-
-    # COCO
-    parser.add_argument(
-        "--coco-image-dir",
-        default="data/coco2017/val2017",
-    )
-    parser.add_argument(
-        "--coco-annotation-path",
-        default="data/coco2017/annotations/instances_val2017.json",
-    )
-
-    # AMBER
-    parser.add_argument(
-        "--amber-root",
-        default="data/amber",
-    )
-    parser.add_argument(
-        "--amber-image-dir",
         default=None,
     )
-    parser.add_argument(
-        "--amber-query-path",
-        default="data/amber/query/query_generative.json",
-    )
-    parser.add_argument(
-        "--amber-annotation-path",
-        default="data/amber/annotations.json",
-    )
 
-    # Qwen dynamic-resolution controls
+    parser.add_argument("--coco-image-dir", default=None)
+    parser.add_argument("--coco-annotation-path", default=None)
+
+    parser.add_argument("--amber-root", default=None)
+    parser.add_argument("--amber-image-dir", default=None)
+    parser.add_argument("--amber-query-path", default=None)
+    parser.add_argument("--amber-annotation-path", default=None)
+
     parser.add_argument("--qwen-min-pixels", type=int, default=None)
     parser.add_argument("--qwen-max-pixels", type=int, default=None)
 
@@ -570,7 +700,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    cfg = load_generation_config(args)
+    args = fill_args_from_config(args, cfg)
+
     validate_args(args)
+    print_effective_config(args, cfg)
 
     seed_everything(args.seed)
 
@@ -630,7 +764,6 @@ def main() -> None:
 
     for batch_idx, batch in enumerate(tqdm(batches, desc="Generating")):
         try:
-            # Stable per-batch seed. Important for VCD / VCD+PHG noised branch.
             batch_seed = stable_seed_from_batch(
                 base_seed=args.seed,
                 batch=batch,

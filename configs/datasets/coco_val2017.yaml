@@ -1,0 +1,5 @@
+dataset_kwargs:
+  prompt: "Describe this image."
+  coco_image_dir: "data/coco2017/val2017"
+  coco_annotation_path: "data/coco2017/annotations/instances_val2017.json"
+  max_samples: null

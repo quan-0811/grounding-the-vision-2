@@ -36,11 +36,6 @@ from utils.image import (
     resize_longest_edge,
 )
 
-from utils.logging import (
-    get_logger,
-    setup_logger,
-)
-
 from utils.image_noise import (
     add_diffusion_noise_to_pil,
     add_diffusion_noise_to_tensor,

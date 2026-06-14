@@ -24,7 +24,7 @@ from grounding.attention import get_kept_lh_from_step, _ensure_head_token_attent
 
 def remove_singletons(mask_bool: np.ndarray) -> np.ndarray:
     """
-    Remove connected components with area < 2.
+    Remove connected components with area < 3.
     """
 
     structure = np.ones((3, 3), dtype=bool)
@@ -39,7 +39,7 @@ def remove_singletons(mask_bool: np.ndarray) -> np.ndarray:
     keep = np.zeros_like(counts, dtype=bool)
 
     if len(keep) > 1:
-        keep[1:] = counts[1:] >= 2
+        keep[1:] = counts[1:] >= 3
 
     return keep[labeled]
 

@@ -1,0 +1,7 @@
+dataset_kwargs:
+  prompt: "Describe this image."
+  amber_root: "data/amber"
+  amber_image_dir: null
+  amber_query_path: "data/amber/query/query_generative.json"
+  amber_annotation_path: "data/amber/annotations.json"
+  max_samples: null

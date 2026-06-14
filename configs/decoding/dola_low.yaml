@@ -1,0 +1,14 @@
+generation:
+  max_new_tokens: 256
+  do_sample: false
+  temperature: 1.0
+  top_p: null
+  top_k: null
+  repetition_penalty: 1.2
+
+decoding_kwargs:
+  dola_relative_top: 0.1
+  dola_select_strategy: "argmax"
+
+phg_kwargs:
+  phg_debug: false
