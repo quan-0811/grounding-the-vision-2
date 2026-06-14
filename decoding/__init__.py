@@ -21,7 +21,6 @@ from decoding.dola import (
 from decoding.vcd import (
     VCDConfig,
     VCDDecoder,
-    add_diffusion_noise,
     apply_vcd_logits,
     generate_vcd_batch,
     generate_vcd_from_inputs,
