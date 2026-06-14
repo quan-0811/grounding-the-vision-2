@@ -779,16 +779,6 @@ def main() -> None:
             all_rows.extend(rows)
             save_json_atomic(all_rows, output_path)
 
-            print("\nSaved:", output_path)
-            print("total rows:", len(all_rows))
-
-            for row in rows:
-                print("-" * 100)
-                print("id:", row.get("id"))
-                print("caption repr:", repr(row.get("caption", "")))
-                print("caption:")
-                print(row.get("caption", ""))
-
         except Exception:
             print("\nFailed at batch:", batch_idx)
             print("Batch sample ids:", [get_sample_id(x) for x in batch])
