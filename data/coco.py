@@ -6,20 +6,12 @@ import json
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
-
+from utils.io import load_json
 
 PathLike = Union[str, Path]
 
 
 DEFAULT_CAPTION_PROMPT = "Describe this image."
-
-
-def _load_json(path: PathLike) -> Any:
-    path = Path(path)
-
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
 
 def _resolve_coco_image_path(
     image_dir: PathLike,
@@ -84,7 +76,7 @@ def load_coco_val2017(
     """
 
     image_dir = Path(image_dir)
-    data = _load_json(annotation_path)
+    data = load_json(annotation_path)
 
     images = data["images"]
     annotations = data.get("annotations", [])
@@ -141,57 +133,3 @@ def load_coco_val2017(
         rows = rows[: int(max_samples)]
 
     return rows
-
-
-def load_coco_sample_ids(
-    sample_ids_path: PathLike,
-) -> List[int]:
-    """
-    Load previously saved COCO sample ids.
-
-    Supports:
-        [1, 2, 3]
-        [{"id": 1}, {"image_id": 2}]
-    """
-
-    data = _load_json(sample_ids_path)
-
-    if isinstance(data, list):
-        if len(data) == 0:
-            return []
-
-        if isinstance(data[0], int):
-            return [int(x) for x in data]
-
-        if isinstance(data[0], dict):
-            ids = []
-
-            for row in data:
-                if "id" in row:
-                    ids.append(int(row["id"]))
-                elif "image_id" in row:
-                    ids.append(int(row["image_id"]))
-                else:
-                    raise KeyError(
-                        "Each sample-id dict must contain `id` or `image_id`."
-                    )
-
-            return ids
-
-    raise ValueError(f"Unsupported sample ids format: {sample_ids_path}")
-
-
-def save_coco_sample_ids(
-    samples: Sequence[Dict[str, Any]],
-    output_path: PathLike,
-) -> None:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    ids = [
-        int(sample.get("image_id", sample["id"]))
-        for sample in samples
-    ]
-
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(ids, f, indent=2)

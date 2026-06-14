@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from utils.io import load_json
+from utils.dict_utils import first_existing
 
 
 PathLike = Union[str, Path]
@@ -38,18 +39,6 @@ def _safe_int(value: Any) -> Optional[int]:
         return int(value)
     except Exception:
         return None
-
-
-def _get_first_existing(
-    row: Dict[str, Any],
-    keys: Sequence[str],
-) -> Any:
-    for key in keys:
-        if key in row and row[key] not in {None, ""}:
-            return row[key]
-
-    return None
-
 
 def find_amber_images(
     root: PathLike = "data/amber",
@@ -207,7 +196,7 @@ def _extract_id(
     row: Dict[str, Any],
     fallback_index: int,
 ) -> Any:
-    value = _get_first_existing(
+    value = first_existing(
         row,
         [
             "id",
@@ -233,7 +222,7 @@ def _extract_prompt(
     row: Dict[str, Any],
     default_prompt: str,
 ) -> str:
-    value = _get_first_existing(
+    value = first_existing(
         row,
         [
             "query",
@@ -261,7 +250,7 @@ def _extract_image_refs(
 ) -> List[str]:
     refs: List[str] = []
 
-    value = _get_first_existing(
+    value = first_existing(
         row,
         [
             "image_path",
@@ -365,7 +354,7 @@ def _normalize_objects(value: Any) -> List[str]:
 
 
 def _extract_objects(row: Dict[str, Any]) -> List[str]:
-    value = _get_first_existing(
+    value = first_existing(
         row,
         [
             "objects",

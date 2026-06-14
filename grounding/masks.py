@@ -19,7 +19,7 @@ except ImportError as exc:
     ) from exc
 
 from grounding.grid import image_attn_to_grid
-from grounding.attention import get_kept_lh_from_step
+from grounding.attention import get_kept_lh_from_step, _ensure_head_token_attention
 
 
 def remove_singletons(mask_bool: np.ndarray) -> np.ndarray:
@@ -71,29 +71,6 @@ def _get_layer_attention(
         return image_attn_by_layer[str_layer_id]
 
     return None
-
-
-def _ensure_head_token_attention(image_attn: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize attention to shape [num_heads, num_image_tokens].
-
-    Accepted:
-        [num_image_tokens]
-        [num_heads, num_image_tokens]
-    """
-
-    image_attn = image_attn.detach().float().cpu()
-
-    if image_attn.dim() == 1:
-        return image_attn.unsqueeze(0)
-
-    if image_attn.dim() == 2:
-        return image_attn
-
-    raise ValueError(
-        f"Expected image attention with dim 1 or 2, got shape={tuple(image_attn.shape)}"
-    )
-
 
 def get_object_mask_from_step(
     step: Dict[str, Any],

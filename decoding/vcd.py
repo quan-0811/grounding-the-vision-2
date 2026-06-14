@@ -39,6 +39,7 @@ from decoding.logits import (
     sample_or_argmax,
 )
 from utils.image_noise import add_diffusion_noise_to_tensor
+from decoding.utils import get_model, get_processor, get_tokenizer, is_qwen_wrapper, move_inputs_to_model, get_eos_token_ids, get_fallback_token_id
 
 
 @dataclass
@@ -58,21 +59,6 @@ class VCDConfig:
     image_tensor_key: str = "pixel_values"
 
     extra_forward_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-
-def add_diffusion_noise(
-    image_tensor: torch.Tensor,
-    noise_step: int = 500,
-) -> torch.Tensor:
-    """
-    Backward-compatible export for stepwise.py.
-    """
-
-    return add_diffusion_noise_to_tensor(
-        image_tensor,
-        noise_step=noise_step,
-    )
-
 
 def apply_vcd_logits(
     clean_logits: torch.Tensor,
@@ -136,91 +122,6 @@ def apply_vcd_logits(
 
     return vcd_scores
 
-
-def _get_model(wrapper: BaseLVLM) -> Any:
-    if hasattr(wrapper, "model"):
-        return wrapper.model
-
-    if hasattr(wrapper, "get_model"):
-        return wrapper.get_model()
-
-    raise AttributeError("Wrapper must expose `.model` or `.get_model()`.")
-
-
-def _get_processor(wrapper: BaseLVLM) -> Any:
-    if hasattr(wrapper, "processor"):
-        return wrapper.processor
-
-    if hasattr(wrapper, "get_processor"):
-        return wrapper.get_processor()
-
-    raise AttributeError("Wrapper must expose `.processor` or `.get_processor()`.")
-
-
-def _get_model_device_and_dtype(model: Any) -> tuple[torch.device, torch.dtype]:
-    param = next(model.parameters())
-    return param.device, param.dtype
-
-
-def _is_qwen_wrapper(wrapper: BaseLVLM) -> bool:
-    model_id = str(
-        getattr(
-            getattr(wrapper, "config", None),
-            "model_id",
-            "",
-        )
-    ).lower()
-
-    return "qwen2-vl" in model_id or "qwen2.5-vl" in model_id
-
-
-def _strip_private_inputs(inputs: TensorDict) -> TensorDict:
-    allowed_tensor_keys = {
-        "input_ids",
-        "attention_mask",
-        "pixel_values",
-        "image_sizes",
-        "image_grid_thw",
-        "pixel_values_videos",
-        "video_grid_thw",
-        "position_ids",
-        "token_type_ids",
-    }
-
-    out: Dict[str, Any] = {}
-
-    for key, value in inputs.items():
-        if str(key).startswith("_"):
-            continue
-
-        if key in allowed_tensor_keys:
-            out[key] = value
-
-    return out
-
-
-def _move_inputs_to_model(
-    inputs: TensorDict,
-    model: Any,
-) -> TensorDict:
-    device, dtype = _get_model_device_and_dtype(model)
-
-    inputs = _strip_private_inputs(inputs)
-
-    moved: Dict[str, Any] = {}
-
-    for key, value in inputs.items():
-        if torch.is_tensor(value):
-            if value.is_floating_point():
-                moved[key] = value.to(device=device, dtype=dtype)
-            else:
-                moved[key] = value.to(device=device)
-        else:
-            moved[key] = value
-
-    return moved
-
-
 def _make_tensor_noised_inputs(
     inputs: TensorDict,
     image_tensor_key: str,
@@ -264,7 +165,7 @@ def _make_contrastive_inputs(
     Qwen2-VL is dispatched to decoding/qwen_vcd.py by decoding/registry.py.
     """
 
-    if _is_qwen_wrapper(wrapper):
+    if is_qwen_wrapper(wrapper):
         raise RuntimeError(
             "Qwen2-VL must not use decoding.vcd.VCDDecoder. "
             "Use decoding.qwen_vcd through decoding.registry instead."
@@ -275,45 +176,6 @@ def _make_contrastive_inputs(
         image_tensor_key=image_tensor_key,
         noise_step=noise_step,
     )
-
-
-def _get_eos_token_ids(
-    model: Any,
-    processor: Any,
-) -> List[int]:
-    eos_token_id = getattr(model.generation_config, "eos_token_id", None)
-
-    if eos_token_id is None and hasattr(processor, "tokenizer"):
-        eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
-
-    if eos_token_id is None:
-        return []
-
-    if isinstance(eos_token_id, int):
-        return [int(eos_token_id)]
-
-    return [int(x) for x in eos_token_id]
-
-
-def _get_fallback_token_id(
-    processor: Any,
-    eos_token_ids: Sequence[int],
-) -> int:
-    if hasattr(processor, "tokenizer"):
-        pad_id = getattr(processor.tokenizer, "pad_token_id", None)
-        eos_id = getattr(processor.tokenizer, "eos_token_id", None)
-
-        if pad_id is not None:
-            return int(pad_id)
-
-        if eos_id is not None:
-            return int(eos_id)
-
-    if len(eos_token_ids) > 0:
-        return int(eos_token_ids[0])
-
-    return 0
-
 
 def _decode_new_tokens(
     wrapper: BaseLVLM,
@@ -413,8 +275,9 @@ class VCDDecoder:
     ) -> GenerationOutput:
         cfg = self.config
 
-        model = _get_model(wrapper)
-        processor = _get_processor(wrapper)
+        model = get_model(wrapper)
+        processor = get_processor(wrapper)
+        tokenizer = get_tokenizer(wrapper, processor)
 
         model.eval()
 
@@ -427,8 +290,8 @@ class VCDDecoder:
             noise_step=cfg.noise_step,
         )
 
-        clean_inputs = _move_inputs_to_model(clean_inputs_cpu, model)
-        cd_inputs = _move_inputs_to_model(cd_inputs_cpu, model)
+        clean_inputs = move_inputs_to_model(clean_inputs_cpu, model)
+        cd_inputs = move_inputs_to_model(cd_inputs_cpu, model)
 
         input_ids = clean_inputs["input_ids"]
 
@@ -450,12 +313,12 @@ class VCDDecoder:
         next_input_ids = input_ids
         next_input_ids_cd = cd_inputs["input_ids"]
 
-        eos_token_ids = _get_eos_token_ids(
+        eos_token_ids = get_eos_token_ids(
             model=model,
-            processor=processor,
+            tokenizer=tokenizer,
         )
 
-        fallback_token_id = _get_fallback_token_id(
+        fallback_token_id = get_fallback_token_id(
             processor=processor,
             eos_token_ids=eos_token_ids,
         )

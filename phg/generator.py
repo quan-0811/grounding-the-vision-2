@@ -28,13 +28,10 @@ from decoding.stepwise import (
     StepwiseConfig,
     StepwiseDecoder,
     _decode_token,
-    _get_eos_token_ids,
-    _get_model,
-    _get_processor,
-    _get_tokenizer,
     _make_noised_inputs,
-    _move_inputs_to_model,
 )
+
+from decoding.utils import get_eos_token_ids, get_model, get_processor, get_tokenizer, move_inputs_to_model, strip_private_inputs, is_qwen_wrapper
 
 from phg.candidates import (
     candidates_to_trace,
@@ -61,38 +58,6 @@ from phg.types import (
 # ============================================================
 # Helpers
 # ============================================================
-
-def _strip_private_inputs(inputs: TensorDict) -> TensorDict:
-    """
-    Remove wrapper-private metadata before forwarding to model(...).
-
-    Qwen2-VL wrapper stores fields like:
-        _qwen_prompts
-        _qwen_image_paths
-        _qwen_images
-
-    These are needed for Qwen VCD rebuilding, but model.forward()
-    must never receive them.
-    """
-
-    return {
-        key: value
-        for key, value in inputs.items()
-        if not str(key).startswith("_")
-    }
-
-
-def _is_qwen_wrapper(wrapper: BaseLVLM) -> bool:
-    model_id = str(
-        getattr(
-            getattr(wrapper, "config", None),
-            "model_id",
-            "",
-        )
-    ).lower()
-
-    return "qwen2-vl" in model_id
-
 
 def _is_sentence_boundary_stop(output: Dict[str, Any]) -> bool:
     return output.get("stop_reason") in {
@@ -211,11 +176,11 @@ class PHGGenerator:
                 "Build it with wrapper.prepare_vcd_inputs() in generate_from_inputs()."
             )
     
-        base_inputs = _strip_private_inputs(base_inputs)
+        base_inputs = strip_private_inputs(base_inputs)
     
-        model = _get_model(wrapper)
-        processor = _get_processor(wrapper)
-        tokenizer = _get_tokenizer(wrapper, processor)
+        model = get_model(wrapper)
+        processor = get_processor(wrapper)
+        tokenizer = get_tokenizer(wrapper, processor)
     
         model.eval()
     
@@ -238,7 +203,7 @@ class PHGGenerator:
         if base_inputs["input_ids"].shape[0] != 1:
             raise ValueError("PHG currently expects batch size 1.")
     
-        eos_token_ids = _get_eos_token_ids(model, tokenizer)
+        eos_token_ids = get_eos_token_ids(model, tokenizer)
     
         prefix_ids = normalize_prefix_ids(prefix_ids)
     
@@ -269,7 +234,7 @@ class PHGGenerator:
                 base_inputs,
                 prefix_ids + generated_ids,
             )
-            select_inputs = _strip_private_inputs(select_inputs)
+            select_inputs = strip_private_inputs(select_inputs)
     
             select_outputs = model(
                 **select_inputs,
@@ -284,7 +249,7 @@ class PHGGenerator:
                     cd_base_inputs,
                     prefix_ids + generated_ids,
                 )
-                select_cd_inputs = _strip_private_inputs(select_cd_inputs)
+                select_cd_inputs = strip_private_inputs(select_cd_inputs)
             
                 cd_select_outputs = model(
                     **select_cd_inputs,
@@ -403,7 +368,7 @@ class PHGGenerator:
                 base_inputs,
                 prefix_ids + generated_ids,
             )
-            attn_inputs = _strip_private_inputs(attn_inputs)
+            attn_inputs = strip_private_inputs(attn_inputs)
     
             attn_outputs = model(
                 **attn_inputs,
@@ -529,7 +494,7 @@ class PHGGenerator:
     ) -> Dict[str, Any]:
         cfg = self.config
     
-        if _is_qwen_wrapper(wrapper):    
+        if is_qwen_wrapper(wrapper):    
             return self._decode_segment_with_checkpoint_qwen_no_cache(
                 wrapper=wrapper,
                 base_inputs=base_inputs,
@@ -539,7 +504,7 @@ class PHGGenerator:
                 cd_base_inputs=cd_base_inputs,
             )
 
-        if cfg.decoding_mode == "vcd" and _is_qwen_wrapper(wrapper):
+        if cfg.decoding_mode == "vcd" and is_qwen_wrapper(wrapper):
             raise RuntimeError(
                 "Qwen2-VL VCD+PHG is not implemented in generic PHG. "
                 "Qwen normal VCD uses decoding/qwen_vcd.py with "
@@ -547,11 +512,11 @@ class PHGGenerator:
                 "stepwise candidate branching."
             )
 
-        base_inputs = _strip_private_inputs(base_inputs)
+        base_inputs = strip_private_inputs(base_inputs)
 
-        model = _get_model(wrapper)
-        processor = _get_processor(wrapper)
-        tokenizer = _get_tokenizer(wrapper, processor)
+        model = get_model(wrapper)
+        processor = get_processor(wrapper)
+        tokenizer = get_tokenizer(wrapper, processor)
 
         model.eval()
 
@@ -571,7 +536,7 @@ class PHGGenerator:
             base_inputs,
             prefix_ids,
         )
-        working_inputs = _strip_private_inputs(working_inputs)
+        working_inputs = strip_private_inputs(working_inputs)
 
         if working_inputs["input_ids"].shape[0] != 1:
             raise ValueError("PHG currently expects batch size 1.")
@@ -592,9 +557,9 @@ class PHGGenerator:
                 image_tensor_key=cfg.image_tensor_key,
                 noise_step=cfg.noise_step,
             )
-            cd_inputs = _strip_private_inputs(cd_inputs)
+            cd_inputs = strip_private_inputs(cd_inputs)
 
-        prefill_inputs = _strip_private_inputs(working_inputs)
+        prefill_inputs = strip_private_inputs(working_inputs)
 
         prefill_outputs = model(
             **prefill_inputs,
@@ -605,7 +570,7 @@ class PHGGenerator:
         cd_prefill_outputs = None
 
         if cfg.decoding_mode == "vcd":
-            cd_prefill_inputs = _strip_private_inputs(cd_inputs)
+            cd_prefill_inputs = strip_private_inputs(cd_inputs)
 
             cd_prefill_outputs = model(
                 **cd_prefill_inputs,
@@ -624,7 +589,7 @@ class PHGGenerator:
         outputs_for_next = prefill_outputs
         cd_outputs_for_next = cd_prefill_outputs
 
-        eos_token_ids = _get_eos_token_ids(model, tokenizer)
+        eos_token_ids = get_eos_token_ids(model, tokenizer)
 
         prefix_ids = normalize_prefix_ids(prefix_ids)
 
@@ -807,12 +772,12 @@ class PHGGenerator:
                 # Qwen2-VL cached step attention may expose only a tiny key window,
                 # which makes image attention length become 1. Recompute the full
                 # prefix with use_cache=False only for attention extraction.
-                if _is_qwen_wrapper(wrapper):
+                if is_qwen_wrapper(wrapper):
                     attn_inputs = append_generated_ids_to_inputs(
                         base_inputs,
                         prefix_ids + generated_ids,
                     )
-                    attn_inputs = _strip_private_inputs(attn_inputs)
+                    attn_inputs = strip_private_inputs(attn_inputs)
             
                     # Important: no cache for this attention-only recompute.
                     attn_forward_kwargs = dict(forward_kwargs)
@@ -939,19 +904,19 @@ class PHGGenerator:
         # _qwen_prompts, _qwen_image_paths, _qwen_images
         original_inputs = inputs
         
-        model = _get_model(wrapper)
-        processor = _get_processor(wrapper)
-        tokenizer = _get_tokenizer(wrapper, processor)
+        model = get_model(wrapper)
+        processor = get_processor(wrapper)
+        tokenizer = get_tokenizer(wrapper, processor)
         
-        base_inputs = _move_inputs_to_model(
-            _strip_private_inputs(original_inputs),
+        base_inputs = move_inputs_to_model(
+            strip_private_inputs(original_inputs),
             model,
         )
-        base_inputs = _strip_private_inputs(base_inputs)
+        base_inputs = strip_private_inputs(base_inputs)
         
         cd_base_inputs = None
         
-        if cfg.decoding_mode == "vcd" and _is_qwen_wrapper(wrapper):
+        if cfg.decoding_mode == "vcd" and is_qwen_wrapper(wrapper):
             if not hasattr(wrapper, "prepare_vcd_inputs"):
                 raise RuntimeError(
                     "Qwen2-VL VCD+PHG requires wrapper.prepare_vcd_inputs()."
@@ -962,11 +927,11 @@ class PHGGenerator:
                 noise_step=cfg.noise_step,
             )
         
-            cd_base_inputs = _move_inputs_to_model(
-                _strip_private_inputs(cd_inputs_cpu),
+            cd_base_inputs = move_inputs_to_model(
+                strip_private_inputs(cd_inputs_cpu),
                 model,
             )
-            cd_base_inputs = _strip_private_inputs(cd_base_inputs)
+            cd_base_inputs = strip_private_inputs(cd_base_inputs)
 
         accepted_generated_ids = normalize_prefix_ids(cfg.prefix_ids)
 

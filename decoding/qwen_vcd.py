@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from transformers import LogitsProcessor, LogitsProcessorList
 
 from models.base import BaseLVLM, GenerationOutput, PathLike, TensorDict
+from decoding.utils import move_inputs_to_model
 
 
 @dataclass
@@ -27,37 +28,6 @@ class QwenVCDConfig:
     top_k: Optional[int] = None
 
     use_cache: bool = True
-
-
-def _strip_private_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        key: value
-        for key, value in inputs.items()
-        if not str(key).startswith("_")
-    }
-
-
-def _move_inputs_to_model(
-    inputs: Dict[str, Any],
-    model: Any,
-) -> Dict[str, Any]:
-    param = next(model.parameters())
-    device = param.device
-    dtype = param.dtype
-
-    moved = {}
-
-    for key, value in _strip_private_inputs(inputs).items():
-        if torch.is_tensor(value):
-            if value.is_floating_point():
-                moved[key] = value.to(device=device, dtype=dtype)
-            else:
-                moved[key] = value.to(device=device)
-        else:
-            moved[key] = value
-
-    return moved
-
 
 def _extend_attention_mask(
     base_attention_mask: torch.Tensor,
@@ -256,14 +226,14 @@ class QwenVCDDecoder:
                 "Qwen VCD requires wrapper.prepare_vcd_inputs()."
             )
 
-        clean_inputs = _move_inputs_to_model(inputs, model)
+        clean_inputs = move_inputs_to_model(inputs, model)
 
         cd_inputs_raw = wrapper.prepare_vcd_inputs(
             inputs,
             noise_step=cfg.noise_step,
         )
 
-        cd_inputs = _move_inputs_to_model(cd_inputs_raw, model)
+        cd_inputs = move_inputs_to_model(cd_inputs_raw, model)
 
         logits_processor = LogitsProcessorList(
             [

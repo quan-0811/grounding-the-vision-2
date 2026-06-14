@@ -26,9 +26,10 @@ from decoding.logits import (
     prepare_logits_for_selection,
     sample_or_argmax,
 )
-from decoding.vcd import add_diffusion_noise, apply_vcd_logits
+from decoding.vcd import apply_vcd_logits
 from grounding.attention import extract_image_attn_by_layer
-
+from decoding.utils import move_inputs_to_model, get_model, get_processor, get_tokenizer, get_eos_token_ids
+from utils.image_noise import add_diffusion_noise_to_tensor
 
 StepwiseMode = Literal["greedy", "dola", "vcd"]
 
@@ -102,59 +103,6 @@ class StepwiseConfig:
 
     extra_forward_kwargs: Dict[str, Any] = field(default_factory=dict)
 
-
-def _get_model(wrapper: BaseLVLM) -> Any:
-    if hasattr(wrapper, "model"):
-        return wrapper.model
-
-    if hasattr(wrapper, "get_model"):
-        return wrapper.get_model()
-
-    raise AttributeError("Wrapper must expose `.model` or `.get_model()`.")
-
-
-def _get_processor(wrapper: BaseLVLM) -> Any:
-    if hasattr(wrapper, "processor"):
-        return wrapper.processor
-
-    if hasattr(wrapper, "get_processor"):
-        return wrapper.get_processor()
-
-    raise AttributeError("Wrapper must expose `.processor` or `.get_processor()`.")
-
-
-def _get_tokenizer(wrapper: BaseLVLM, processor: Any) -> Any:
-    if hasattr(wrapper, "tokenizer"):
-        return wrapper.tokenizer
-
-    if hasattr(processor, "tokenizer"):
-        return processor.tokenizer
-
-    return processor
-
-
-def _get_model_device_and_dtype(model: Any) -> tuple[torch.device, torch.dtype]:
-    param = next(model.parameters())
-    return param.device, param.dtype
-
-
-def _move_inputs_to_model(inputs: TensorDict, model: Any) -> TensorDict:
-    device, dtype = _get_model_device_and_dtype(model)
-
-    moved: Dict[str, Any] = {}
-
-    for key, value in inputs.items():
-        if torch.is_tensor(value):
-            if value.is_floating_point():
-                moved[key] = value.to(device=device, dtype=dtype)
-            else:
-                moved[key] = value.to(device=device)
-        else:
-            moved[key] = value
-
-    return moved
-
-
 def _make_noised_inputs(
     inputs: TensorDict,
     image_tensor_key: str,
@@ -174,28 +122,12 @@ def _make_noised_inputs(
         else:
             noised[key] = value
 
-    noised[image_tensor_key] = add_diffusion_noise(
+    noised[image_tensor_key] = add_diffusion_noise_to_tensor(
         noised[image_tensor_key],
         noise_step=noise_step,
     )
 
     return noised
-
-
-def _get_eos_token_ids(model: Any, tokenizer: Any) -> List[int]:
-    eos_token_id = getattr(model.generation_config, "eos_token_id", None)
-
-    if eos_token_id is None:
-        eos_token_id = getattr(tokenizer, "eos_token_id", None)
-
-    if eos_token_id is None:
-        return []
-
-    if isinstance(eos_token_id, int):
-        return [int(eos_token_id)]
-
-    return [int(x) for x in eos_token_id]
-
 
 def _decode_token(tokenizer: Any, token_id: int) -> str:
     return tokenizer.decode(
@@ -505,13 +437,13 @@ class StepwiseDecoder:
     ) -> StepwiseOutput:
         cfg = self.config
 
-        model = _get_model(wrapper)
-        processor = _get_processor(wrapper)
-        tokenizer = _get_tokenizer(wrapper, processor)
+        model = get_model(wrapper)
+        processor = get_processor(wrapper)
+        tokenizer = get_tokenizer(wrapper, processor)
 
         model.eval()
 
-        inputs = _move_inputs_to_model(inputs, model)
+        inputs = move_inputs_to_model(inputs, model)
 
         if inputs["input_ids"].shape[0] != 1:
             raise ValueError("Stepwise decoding currently expects batch size 1.")
@@ -560,7 +492,7 @@ class StepwiseDecoder:
         outputs_for_next = prefill_outputs
         cd_outputs_for_next = cd_prefill_outputs
 
-        eos_token_ids = _get_eos_token_ids(model, tokenizer)
+        eos_token_ids = get_eos_token_ids(model, tokenizer)
 
         generated_token_ids: List[int] = []
         generated_token_texts: List[str] = []
