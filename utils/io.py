@@ -100,24 +100,6 @@ def save_json_atomic(
             os.remove(tmp_path)
         raise
 
-
-def load_jsonl(path: PathLike) -> List[Any]:
-    path = Path(path)
-
-    rows = []
-
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            rows.append(json.loads(line))
-
-    return rows
-
-
 def save_jsonl(
     rows: Iterable[Any],
     path: PathLike,
@@ -135,52 +117,6 @@ def save_jsonl(
                 )
                 + "\n"
             )
-
-
-def append_jsonl(
-    row: Any,
-    path: PathLike,
-    ensure_ascii: bool = False,
-) -> None:
-    path = Path(path)
-    ensure_dir(path)
-
-    with path.open("a", encoding="utf-8") as f:
-        f.write(
-            json.dumps(
-                row,
-                ensure_ascii=ensure_ascii,
-            )
-            + "\n"
-        )
-
-
-def file_exists(path: PathLike) -> bool:
-    return Path(path).exists()
-
-
-def count_json_rows(path: PathLike) -> int:
-    """
-    Count rows in a JSON list or JSONL file.
-
-    Useful for resume logic.
-    """
-
-    path = Path(path)
-
-    if not path.exists():
-        return 0
-
-    if path.suffix == ".jsonl":
-        with path.open("r", encoding="utf-8") as f:
-            return sum(1 for line in f if line.strip())
-
-    data = load_json(path)
-
-    if isinstance(data, list):
-        return len(data)
-
-    return 1
 
 def load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
     text = path.read_text(encoding="utf-8").strip()

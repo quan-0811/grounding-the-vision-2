@@ -5,16 +5,16 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
-import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from utils.io import load_json_or_jsonl, save_json
-from utils.dict_utils import first_existing, maybe_int
-from evaluation.formatters import format_amber_row
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.io import load_json_or_jsonl, save_json
+from evaluation.formatters import format_amber_row
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))

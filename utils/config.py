@@ -41,23 +41,6 @@ def load_yaml(path: PathLike) -> Dict[str, Any]:
 
     return data
 
-
-def save_yaml(
-    obj: Dict[str, Any],
-    path: PathLike,
-) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(
-            obj,
-            f,
-            sort_keys=False,
-            allow_unicode=True,
-        )
-
-
 def deep_update(
     base: Dict[str, Any],
     override: Optional[Dict[str, Any]] = None,
@@ -88,23 +71,6 @@ def deep_update(
 
     return result
 
-
-def load_many_yamls(*paths: PathLike) -> Dict[str, Any]:
-    """
-    Load multiple YAML configs and merge them in order.
-
-    Later files override earlier files.
-    """
-
-    merged: Dict[str, Any] = {}
-
-    for path in paths:
-        cfg = load_yaml(path)
-        merged = deep_update(merged, cfg)
-
-    return merged
-
-
 def get_config_section(
     cfg: Dict[str, Any],
     key: str,
@@ -119,25 +85,3 @@ def get_config_section(
         raise ValueError(f"Config section `{key}` must be a dict.")
 
     return value
-
-
-def pop_known_keys(
-    cfg: Dict[str, Any],
-    known_keys: set[str],
-) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Split config into known and unknown keys.
-
-    Useful for separating dataclass kwargs from extra kwargs.
-    """
-
-    known = {}
-    unknown = {}
-
-    for key, value in cfg.items():
-        if key in known_keys:
-            known[key] = value
-        else:
-            unknown[key] = value
-
-    return known, unknown

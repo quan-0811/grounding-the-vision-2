@@ -3,20 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 import pickle
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from utils.io import load_json_or_jsonl, save_json, save_jsonl
-from utils.dict_utils import first_existing, maybe_int
-from evaluation.formatters import format_coco_row
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.io import load_json_or_jsonl, save_json, save_jsonl
+from evaluation.formatters import format_coco_row
 
 def default_formatted_path(input_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{input_path.stem}_chair_format.jsonl"
