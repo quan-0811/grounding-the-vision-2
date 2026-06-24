@@ -16,9 +16,9 @@ from models.base import BaseLVLM, GenerationOutput, PathLike, TensorDict
 
 @dataclass
 class DoLAConfig:
-    max_new_tokens: int = 256
+    max_new_tokens: int = 128
     dola_layers: Union[str, Sequence[int]] = "low"
-    repetition_penalty: float = 1.2
+    repetition_penalty: Optional[float] = None
     use_cache: bool = True
 
     do_sample: bool = False

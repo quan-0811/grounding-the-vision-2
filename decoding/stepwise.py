@@ -33,7 +33,6 @@ from utils.image_noise import add_diffusion_noise_to_tensor
 
 StepwiseMode = Literal["greedy", "dola", "vcd"]
 
-
 @dataclass
 class StepRecord:
     step: int

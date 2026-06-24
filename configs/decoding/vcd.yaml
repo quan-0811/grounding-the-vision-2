@@ -4,7 +4,6 @@ generation:
   temperature: 1.0
   top_p: null
   top_k: null
-  repetition_penalty: 1.2
 
 decoding_kwargs:
   cd_alpha: 1.0
