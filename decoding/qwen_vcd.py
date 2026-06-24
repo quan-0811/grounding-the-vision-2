@@ -380,40 +380,6 @@ def _coerce_config(config: Any) -> QwenVCDConfig:
     )
 
 
-def generate_qwen_vcd_from_inputs(
-    wrapper: BaseLVLM,
-    inputs: TensorDict,
-    config: Optional[Any] = None,
-) -> GenerationOutput:
-    return QwenVCDDecoder(
-        _coerce_config(config)
-    ).generate_from_inputs(
-        wrapper=wrapper,
-        inputs=inputs,
-    )
-
-
-def generate_qwen_vcd_batch(
-    wrapper: BaseLVLM,
-    image_paths: Optional[Sequence[PathLike]] = None,
-    images: Optional[Sequence[Any]] = None,
-    prompts: Union[str, Sequence[str]] = "Describe this image.",
-    config: Optional[Any] = None,
-    use_chat_template: Optional[bool] = True,
-    **prepare_kwargs: Any,
-) -> GenerationOutput:
-    return QwenVCDDecoder(
-        _coerce_config(config)
-    ).generate_batch(
-        wrapper=wrapper,
-        image_paths=image_paths,
-        images=images,
-        prompts=prompts,
-        use_chat_template=True,
-        **prepare_kwargs,
-    )
-
-
 def generate_qwen_vcd_samples(
     wrapper: BaseLVLM,
     samples: Sequence[Dict[str, Any]],

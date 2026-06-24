@@ -18,11 +18,16 @@ from models.base import BaseLVLM, GenerationOutput, PathLike, TensorDict
 class DoLAConfig:
     max_new_tokens: int = 128
     dola_layers: Union[str, Sequence[int]] = "low"
+    dola_relative_top: Optional[float] = None
+    dola_select_strategy: str = "js"
     repetition_penalty: Optional[float] = None
     use_cache: bool = True
 
     do_sample: bool = False
     num_beams: int = 1
+    temperature: float = 1.0
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
 
     length_penalty: Optional[float] = None
     no_repeat_ngram_size: Optional[int] = None
@@ -46,11 +51,22 @@ class DoLADecoder:
             "repetition_penalty": cfg.repetition_penalty,
         }
 
+        if cfg.dola_relative_top is not None:
+            kwargs["dola_relative_top"] = cfg.dola_relative_top
+        kwargs["dola_select_strategy"] = cfg.dola_select_strategy
+
         if cfg.length_penalty is not None:
             kwargs["length_penalty"] = cfg.length_penalty
 
         if cfg.no_repeat_ngram_size is not None:
             kwargs["no_repeat_ngram_size"] = cfg.no_repeat_ngram_size
+
+        if cfg.do_sample:
+            kwargs["temperature"] = cfg.temperature
+            if cfg.top_p is not None:
+                kwargs["top_p"] = cfg.top_p
+            if cfg.top_k is not None:
+                kwargs["top_k"] = cfg.top_k
 
         kwargs.update(cfg.extra_generate_kwargs)
         kwargs.update(override_kwargs)
@@ -130,38 +146,6 @@ class DoLADecoder:
             rows.append(row)
 
         return rows
-
-
-def generate_dola_from_inputs(
-    wrapper: BaseLVLM,
-    inputs: TensorDict,
-    config: Optional[DoLAConfig] = None,
-    **override_generate_kwargs: Any,
-) -> GenerationOutput:
-    return DoLADecoder(config).generate_from_inputs(
-        wrapper=wrapper,
-        inputs=inputs,
-        **override_generate_kwargs,
-    )
-
-
-def generate_dola_batch(
-    wrapper: BaseLVLM,
-    image_paths: Optional[Sequence[PathLike]] = None,
-    images: Optional[Sequence[Any]] = None,
-    prompts: Union[str, Sequence[str]] = "Describe this image.",
-    config: Optional[DoLAConfig] = None,
-    use_chat_template: Optional[bool] = None,
-    **prepare_kwargs: Any,
-) -> GenerationOutput:
-    return DoLADecoder(config).generate_batch(
-        wrapper=wrapper,
-        image_paths=image_paths,
-        images=images,
-        prompts=prompts,
-        use_chat_template=use_chat_template,
-        **prepare_kwargs,
-    )
 
 
 def generate_dola_samples(

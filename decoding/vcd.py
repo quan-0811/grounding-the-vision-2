@@ -38,8 +38,16 @@ from decoding.logits import (
     prepare_logits_for_selection,
     sample_or_argmax,
 )
-from utils.image_noise import add_diffusion_noise_to_tensor
-from decoding.utils import get_model, get_processor, get_tokenizer, is_qwen_wrapper, move_inputs_to_model, get_eos_token_ids, get_fallback_token_id
+from decoding.utils import (
+    get_eos_token_ids,
+    get_fallback_token_id,
+    get_model,
+    get_processor,
+    get_tokenizer,
+    is_qwen_wrapper,
+    make_noised_inputs,
+    move_inputs_to_model,
+)
 
 
 @dataclass
@@ -122,36 +130,6 @@ def apply_vcd_logits(
 
     return vcd_scores
 
-def _make_tensor_noised_inputs(
-    inputs: TensorDict,
-    image_tensor_key: str,
-    noise_step: int,
-) -> TensorDict:
-    if image_tensor_key not in inputs:
-        raise KeyError(
-            f"Expected `{image_tensor_key}` in inputs. "
-            f"Available keys: {list(inputs.keys())}"
-        )
-
-    noised: Dict[str, Any] = {}
-
-    for key, value in inputs.items():
-        if str(key).startswith("_"):
-            continue
-
-        if torch.is_tensor(value):
-            noised[key] = value.clone()
-        else:
-            noised[key] = value
-
-    noised[image_tensor_key] = add_diffusion_noise_to_tensor(
-        noised[image_tensor_key],
-        noise_step=noise_step,
-    )
-
-    return noised
-
-
 def _make_contrastive_inputs(
     wrapper: BaseLVLM,
     clean_inputs_cpu: TensorDict,
@@ -171,10 +149,11 @@ def _make_contrastive_inputs(
             "Use decoding.qwen_vcd through decoding.registry instead."
         )
 
-    return _make_tensor_noised_inputs(
+    return make_noised_inputs(
         clean_inputs_cpu,
         image_tensor_key=image_tensor_key,
         noise_step=noise_step,
+        skip_private_keys=True,
     )
 
 def _decode_new_tokens(
@@ -517,38 +496,6 @@ class VCDDecoder:
             rows.append(row)
 
         return rows
-
-
-def generate_vcd_from_inputs(
-    wrapper: BaseLVLM,
-    inputs: TensorDict,
-    config: Optional[VCDConfig] = None,
-    **override_forward_kwargs: Any,
-) -> GenerationOutput:
-    return VCDDecoder(config).generate_from_inputs(
-        wrapper=wrapper,
-        inputs=inputs,
-        **override_forward_kwargs,
-    )
-
-
-def generate_vcd_batch(
-    wrapper: BaseLVLM,
-    image_paths: Optional[Sequence[PathLike]] = None,
-    images: Optional[Sequence[Any]] = None,
-    prompts: Union[str, Sequence[str]] = "Describe this image.",
-    config: Optional[VCDConfig] = None,
-    use_chat_template: Optional[bool] = None,
-    **prepare_kwargs: Any,
-) -> GenerationOutput:
-    return VCDDecoder(config).generate_batch(
-        wrapper=wrapper,
-        image_paths=image_paths,
-        images=images,
-        prompts=prompts,
-        use_chat_template=use_chat_template,
-        **prepare_kwargs,
-    )
 
 
 def generate_vcd_samples(

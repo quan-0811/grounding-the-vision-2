@@ -3,8 +3,14 @@
 import argparse
 import json
 import os
-import re
+import sys
+from pathlib import Path
 from typing import Any, Dict, List
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from pycocotools.coco import COCO
 
@@ -13,69 +19,9 @@ from pycocoevalcap.bleu.bleu import Bleu
 from pycocoevalcap.meteor.meteor import Meteor
 from pycocoevalcap.rouge.rouge import Rouge
 
-
-def load_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
-    if path.endswith(".jsonl"):
-        records = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
-        return records
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        for key in ["results", "predictions", "data", "samples"]:
-            if key in data and isinstance(data[key], list):
-                return data[key]
-
-    raise ValueError(f"Unsupported prediction format: {path}")
-
-
-def extract_int_id(value: Any) -> int:
-    """
-    Supports:
-    - 391895
-    - "391895"
-    - "COCO_val2017_000000391895.jpg"
-    - "/path/to/000000391895.jpg"
-    """
-    if isinstance(value, int):
-        return value
-
-    value = str(value)
-    base = os.path.splitext(os.path.basename(value))[0]
-
-    if base.isdigit():
-        return int(base)
-
-    matches = re.findall(r"\d+", base)
-    if matches:
-        return int(matches[-1])
-
-    raise ValueError(f"Cannot extract integer image id from value: {value}")
-
-
-def get_image_id(record: Dict[str, Any]) -> int:
-    for key in ["image_id", "coco_image_id", "id", "image", "image_path", "file_name"]:
-        if key in record:
-            return extract_int_id(record[key])
-
-    raise KeyError(f"Cannot find image id field in record keys: {record.keys()}")
-
-
-def get_caption(record: Dict[str, Any]) -> str:
-    for key in ["caption", "response", "text", "generated_text", "prediction", "answer"]:
-        if key in record and record[key] is not None:
-            return str(record[key]).strip()
-
-    raise KeyError(f"Cannot find caption field in record keys: {record.keys()}")
+from utils.io import load_json_or_jsonl
+from utils.dict_utils import extract_int_id, get_image_id
+from evaluation.formatters import get_caption
 
 
 def convert_to_coco_caption_format(pred_path: str, out_path: str) -> List[Dict[str, Any]]:
@@ -87,6 +33,8 @@ def convert_to_coco_caption_format(pred_path: str, out_path: str) -> List[Dict[s
     for record in records:
         image_id = get_image_id(record)
         caption = get_caption(record)
+        if caption is None:
+            raise KeyError(f"Cannot find caption field in record keys: {list(record.keys())}")
 
         # COCO caption evaluation expects one prediction per image.
         if image_id in seen:

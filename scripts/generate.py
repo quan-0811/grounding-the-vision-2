@@ -78,7 +78,7 @@ HARD_DEFAULTS: Dict[str, Any] = {
     "noise_step": 500,
 
     "dola_relative_top": 0.1,
-    "dola_select_strategy": "argmax",
+    "dola_select_strategy": "js",
 
     "phg_max_rounds": 5,
     "phg_min_new_tokens": 3,

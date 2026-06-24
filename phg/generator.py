@@ -27,11 +27,19 @@ from models.base import BaseLVLM, PathLike, TensorDict
 from decoding.stepwise import (
     StepwiseConfig,
     StepwiseDecoder,
-    _decode_token,
-    _make_noised_inputs,
 )
 
-from decoding.utils import get_eos_token_ids, get_model, get_processor, get_tokenizer, move_inputs_to_model, strip_private_inputs, is_qwen_wrapper
+from decoding.utils import (
+    get_eos_token_ids,
+    get_model,
+    get_processor,
+    get_tokenizer,
+    decode_token,
+    is_qwen_wrapper,
+    make_noised_inputs,
+    move_inputs_to_model,
+    strip_private_inputs,
+)
 
 from phg.candidates import (
     candidates_to_trace,
@@ -44,6 +52,8 @@ from phg.checkpoint import (
     extract_output_segment_by_abs_range,
     normalize_prefix_ids,
 )
+from grounding.attention import extract_image_attn_by_layer
+
 from phg.memory import PHGMemory
 from phg.scoring import score_segment
 from phg.types import (
@@ -356,7 +366,7 @@ class PHGGenerator:
                 )
     
             token_id = int(next_token[0, 0].item())
-            token_text = _decode_token(tokenizer, token_id)
+            token_text = decode_token(tokenizer, token_id)
     
             generated_ids.append(token_id)
     
@@ -379,8 +389,6 @@ class PHGGenerator:
             image_attn_by_layer = None
     
             if attn_outputs.attentions is not None:
-                from grounding.attention import extract_image_attn_by_layer
-    
                 image_attn_by_layer, image_token_indices = extract_image_attn_by_layer(
                     attentions=attn_outputs.attentions,
                     input_ids=attn_inputs["input_ids"],
@@ -552,7 +560,7 @@ class PHGGenerator:
         cd_inputs = None
 
         if cfg.decoding_mode == "vcd":
-            cd_inputs = _make_noised_inputs(
+            cd_inputs = make_noised_inputs(
                 working_inputs,
                 image_tensor_key=cfg.image_tensor_key,
                 noise_step=cfg.noise_step,
@@ -713,7 +721,7 @@ class PHGGenerator:
                 )
 
             token_id = int(next_token[0, 0].item())
-            token_text = _decode_token(tokenizer, token_id)
+            token_text = decode_token(tokenizer, token_id)
 
             generated_ids.append(token_id)
 
@@ -764,8 +772,6 @@ class PHGGenerator:
             image_attn_by_layer = None
 
             if step_outputs.attentions is not None:
-                from grounding.attention import extract_image_attn_by_layer
-            
                 attn_outputs = step_outputs
                 attn_input_ids = input_ids
             
@@ -1270,40 +1276,6 @@ class PHGGenerator:
 # ============================================================
 # Public functions
 # ============================================================
-
-def generate_phg_from_inputs(
-    wrapper: BaseLVLM,
-    inputs: TensorDict,
-    config: Optional[PHGConfig] = None,
-) -> PHGOutput:
-    generator = PHGGenerator(config)
-
-    return generator.generate_from_inputs(
-        wrapper=wrapper,
-        inputs=inputs,
-    )
-
-
-def generate_phg_batch(
-    wrapper: BaseLVLM,
-    image_paths: Optional[Sequence[PathLike]] = None,
-    images: Optional[Sequence[Any]] = None,
-    prompts: Union[str, Sequence[str]] = "Describe this image.",
-    config: Optional[PHGConfig] = None,
-    use_chat_template: Optional[bool] = None,
-    **prepare_kwargs: Any,
-) -> PHGOutput:
-    generator = PHGGenerator(config)
-
-    return generator.generate_batch(
-        wrapper=wrapper,
-        image_paths=image_paths,
-        images=images,
-        prompts=prompts,
-        use_chat_template=use_chat_template,
-        **prepare_kwargs,
-    )
-
 
 def generate_phg_samples(
     wrapper: BaseLVLM,

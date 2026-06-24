@@ -1,4 +1,4 @@
-# evaluation/formatters/format_predictions.py
+# evaluation/formatters.py
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from utils.dict_utils import first_existing, maybe_int
 
 
 def get_caption(row: Dict[str, Any]) -> Optional[str]:
-    value = first_existing(row, ["caption", "response", "prediction", "text"])
+    value = first_existing(row, [
+        "caption", "response", "text", "generated_text", "prediction", "answer",
+    ])
 
     if value is None:
         return None

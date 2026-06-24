@@ -16,8 +16,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.io import load_json_or_jsonl, save_json
 from evaluation.formatters import format_amber_row
 
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 def default_formatted_path(input_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{input_path.stem}_amber_format.json"

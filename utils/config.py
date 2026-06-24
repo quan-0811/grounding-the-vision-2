@@ -16,15 +16,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from utils.io import PathLike
+
 try:
     import yaml
 except ImportError as exc:
     raise ImportError(
         "utils.config requires PyYAML. Install with: pip install pyyaml"
     ) from exc
-
-
-PathLike = Union[str, Path]
 
 
 def load_yaml(path: PathLike) -> Dict[str, Any]:

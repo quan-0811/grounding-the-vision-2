@@ -28,8 +28,15 @@ from decoding.logits import (
 )
 from decoding.vcd import apply_vcd_logits
 from grounding.attention import extract_image_attn_by_layer
-from decoding.utils import move_inputs_to_model, get_model, get_processor, get_tokenizer, get_eos_token_ids
-from utils.image_noise import add_diffusion_noise_to_tensor
+from decoding.utils import (
+    decode_token,
+    get_eos_token_ids,
+    get_model,
+    get_processor,
+    get_tokenizer,
+    make_noised_inputs,
+    move_inputs_to_model,
+)
 
 StepwiseMode = Literal["greedy", "dola", "vcd"]
 
@@ -101,40 +108,6 @@ class StepwiseConfig:
     image_tensor_key: str = "pixel_values"
 
     extra_forward_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-def _make_noised_inputs(
-    inputs: TensorDict,
-    image_tensor_key: str,
-    noise_step: int,
-) -> TensorDict:
-    if image_tensor_key not in inputs:
-        raise KeyError(
-            f"Expected `{image_tensor_key}` in inputs. "
-            f"Available keys: {list(inputs.keys())}"
-        )
-
-    noised: Dict[str, Any] = {}
-
-    for key, value in inputs.items():
-        if torch.is_tensor(value):
-            noised[key] = value.clone()
-        else:
-            noised[key] = value
-
-    noised[image_tensor_key] = add_diffusion_noise_to_tensor(
-        noised[image_tensor_key],
-        noise_step=noise_step,
-    )
-
-    return noised
-
-def _decode_token(tokenizer: Any, token_id: int) -> str:
-    return tokenizer.decode(
-        [int(token_id)],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
-
 
 def _decode_caption(
     wrapper: BaseLVLM,
@@ -460,7 +433,7 @@ class StepwiseDecoder:
         cd_inputs = None
 
         if cfg.decoding_mode == "vcd":
-            cd_inputs = _make_noised_inputs(
+            cd_inputs = make_noised_inputs(
                 inputs,
                 image_tensor_key=cfg.image_tensor_key,
                 noise_step=cfg.noise_step,
@@ -531,7 +504,7 @@ class StepwiseDecoder:
             )
 
             token_id = int(next_token[0, 0].item())
-            token_text = _decode_token(tokenizer, token_id)
+            token_text = decode_token(tokenizer, token_id)
 
             generated_token_ids.append(token_id)
             generated_token_texts.append(token_text)
@@ -672,33 +645,3 @@ class StepwiseDecoder:
         return self.generate_from_inputs(wrapper, inputs)
 
 
-def generate_stepwise_from_inputs(
-    wrapper: BaseLVLM,
-    inputs: TensorDict,
-    config: Optional[StepwiseConfig] = None,
-    **override_forward_kwargs: Any,
-) -> StepwiseOutput:
-    return StepwiseDecoder(config).generate_from_inputs(
-        wrapper=wrapper,
-        inputs=inputs,
-        **override_forward_kwargs,
-    )
-
-
-def generate_stepwise_batch(
-    wrapper: BaseLVLM,
-    image_paths: Optional[Sequence[PathLike]] = None,
-    images: Optional[Sequence[Any]] = None,
-    prompts: Union[str, Sequence[str]] = "Describe this image.",
-    config: Optional[StepwiseConfig] = None,
-    use_chat_template: Optional[bool] = None,
-    **prepare_kwargs: Any,
-) -> StepwiseOutput:
-    return StepwiseDecoder(config).generate_batch(
-        wrapper=wrapper,
-        image_paths=image_paths,
-        images=images,
-        prompts=prompts,
-        use_chat_template=use_chat_template,
-        **prepare_kwargs,
-    )

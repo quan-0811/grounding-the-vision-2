@@ -4,13 +4,9 @@ Image utilities.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Union
-
 from PIL import Image
 
-
-PathLike = Union[str, Path]
+from utils.io import PathLike
 
 
 def load_image(
