@@ -1,1 +1,0 @@
-# grounding-the-vision-2
