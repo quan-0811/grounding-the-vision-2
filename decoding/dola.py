@@ -53,7 +53,6 @@ class DoLADecoder:
 
         if cfg.dola_relative_top is not None:
             kwargs["dola_relative_top"] = cfg.dola_relative_top
-        kwargs["dola_select_strategy"] = cfg.dola_select_strategy
 
         if cfg.length_penalty is not None:
             kwargs["length_penalty"] = cfg.length_penalty
