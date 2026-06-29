@@ -1,7 +1,16 @@
+from typing import Any, Dict, List, Sequence
+
 import torch
-from models.base import TensorDict
-from typing import Dict, Any, List, Sequence
-from models.base import BaseLVLM
+
+from models.base import BaseLVLM, TensorDict
+
+
+def decode_token(tokenizer: Any, token_id: int) -> str:
+    return tokenizer.decode(
+        [int(token_id)],
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
 
 def strip_private_inputs(inputs: TensorDict) -> TensorDict:
     return {
@@ -103,3 +112,33 @@ def is_qwen_wrapper(wrapper: BaseLVLM) -> bool:
     ).lower()
 
     return "qwen2-vl" in model_id
+
+
+def make_noised_inputs(
+    inputs: TensorDict,
+    image_tensor_key: str,
+    noise_step: int,
+    skip_private_keys: bool = False,
+) -> TensorDict:
+    from utils.image_noise import add_diffusion_noise_to_tensor
+
+    if image_tensor_key not in inputs:
+        raise KeyError(
+            f"Expected `{image_tensor_key}` in inputs. "
+            f"Available keys: {list(inputs.keys())}"
+        )
+
+    noised: Dict[str, Any] = {}
+    for key, value in inputs.items():
+        if skip_private_keys and str(key).startswith("_"):
+            continue
+        if torch.is_tensor(value):
+            noised[key] = value.clone()
+        else:
+            noised[key] = value
+
+    noised[image_tensor_key] = add_diffusion_noise_to_tensor(
+        noised[image_tensor_key],
+        noise_step=noise_step,
+    )
+    return noised

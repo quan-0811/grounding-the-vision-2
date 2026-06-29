@@ -33,7 +33,5 @@ from phg.scoring import score_segment
 
 from phg.generator import (
     PHGGenerator,
-    generate_phg_batch,
-    generate_phg_from_inputs,
     generate_phg_samples,
 )

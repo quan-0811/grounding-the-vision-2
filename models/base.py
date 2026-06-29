@@ -17,13 +17,12 @@ decoding/stepwise.py, and phg/generator.py to stay model-agnostic.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Union
 
 import torch
 
+from utils.io import PathLike
 
-PathLike = Union[str, Path]
 TensorDict = Dict[str, Any]
 
 

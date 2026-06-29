@@ -6,13 +6,10 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence
 
-from utils.io import load_json
+from utils.io import load_json, PathLike
 from utils.dict_utils import first_existing
-
-
-PathLike = Union[str, Path]
 
 DEFAULT_AMBER_PROMPT = "Describe this image."
 

@@ -328,7 +328,6 @@ class Qwen2VLWrapper:
         output_ids = self.model.generate(
             **moved,
             **generate_kwargs,
-            trust_remote_code=True,
         )
 
         generated_ids_trimmed = [

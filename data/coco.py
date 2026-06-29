@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
-from utils.io import load_json
-
-PathLike = Union[str, Path]
+from typing import Any, Dict, List, Optional, Sequence
+from utils.io import load_json, PathLike
 
 
 DEFAULT_CAPTION_PROMPT = "Describe this image."

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence
 
 from models.base import BaseLVLM
+from decoding.utils import is_qwen_wrapper
 
 
 SUPPORTED_DECODERS = {
@@ -12,13 +13,6 @@ SUPPORTED_DECODERS = {
     "dola_low",
     "vcd",
 }
-
-
-def _is_qwen2vl_wrapper(wrapper: BaseLVLM) -> bool:
-    model_id = getattr(getattr(wrapper, "config", None), "model_id", "")
-    model_id = str(model_id).lower()
-
-    return "qwen2-vl" in model_id or "qwen2.5-vl" in model_id
 
 
 def build_decoder_config(
@@ -80,7 +74,7 @@ def generate_samples_with_decoder(
         )
 
     if name == "vcd":
-        if _is_qwen2vl_wrapper(wrapper):
+        if is_qwen_wrapper(wrapper):
             from decoding.qwen_vcd import generate_qwen_vcd_samples
 
             return generate_qwen_vcd_samples(

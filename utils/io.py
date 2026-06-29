@@ -118,7 +118,8 @@ def save_jsonl(
                 + "\n"
             )
 
-def load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
+def load_json_or_jsonl(path: PathLike) -> List[Dict[str, Any]]:
+    path = Path(path)
     text = path.read_text(encoding="utf-8").strip()
 
     if not text:
@@ -129,6 +130,14 @@ def load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
         if not isinstance(data, list):
             raise ValueError(f"Expected JSON list in {path}")
         return data
+
+    if text.startswith("{"):
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ["results", "predictions", "data", "samples"]:
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+        raise ValueError(f"Unsupported JSON dict format in {path}")
 
     rows: List[Dict[str, Any]] = []
 
